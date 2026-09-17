@@ -41,16 +41,28 @@ app.get('/uploads/scopes/:filename', async (req, res) => {
     const filename = req.params.filename;
     const Project = require('./models/Project');
 
-    // 1. Try to find in MongoDB Project model
-    const project = await Project.findOne({ 'scopeDocument.fileName': filename });
-    if (project && project.scopeDocument && project.scopeDocument.fileData) {
-      const buffer = Buffer.from(project.scopeDocument.fileData, 'base64');
-      res.setHeader('Content-Type', project.scopeDocument.fileType || 'application/pdf');
-      res.setHeader(
-        'Content-Disposition',
-        `inline; filename="${encodeURIComponent(project.scopeDocument.originalName || filename)}"`
-      );
-      return res.send(buffer);
+    // 1. Try to find in MongoDB Project model (checks both multiple scopeDocuments and legacy scopeDocument)
+    const project = await Project.findOne({
+      $or: [
+        { 'scopeDocuments.fileName': filename },
+        { 'scopeDocument.fileName': filename },
+      ],
+    });
+
+    if (project) {
+      const doc =
+        project.scopeDocuments?.find((d) => d.fileName === filename) ||
+        (project.scopeDocument?.fileName === filename ? project.scopeDocument : null);
+
+      if (doc && doc.fileData) {
+        const buffer = Buffer.from(doc.fileData, 'base64');
+        res.setHeader('Content-Type', doc.fileType || 'application/pdf');
+        res.setHeader(
+          'Content-Disposition',
+          `inline; filename="${encodeURIComponent(doc.originalName || filename)}"`
+        );
+        return res.send(buffer);
+      }
     }
 
     // 2. Try disk locations (local dev or seeded sample files)

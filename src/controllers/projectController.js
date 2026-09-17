@@ -29,7 +29,7 @@ exports.getProjects = async (req, res) => {
     }
 
     const projects = await Project.find(filter)
-      .select('-scopeDocument.fileData')
+      .select('-scopeDocument.fileData -scopeDocuments.fileData')
       .populate('projectManager', 'name email')
       .populate('assignedMembers.user', 'name email department designation')
       .sort({ updatedAt: -1 });
@@ -45,9 +45,10 @@ exports.getProjects = async (req, res) => {
 exports.getProjectById = async (req, res) => {
   try {
     const project = await Project.findById(req.params.id)
-      .select('-scopeDocument.fileData')
+      .select('-scopeDocument.fileData -scopeDocuments.fileData')
       .populate('projectManager', 'name email role phone')
-      .populate('assignedMembers.user', 'name email department designation baseSalary dailyWage');
+      .populate('assignedMembers.user', 'name email department designation baseSalary dailyWage')
+      .populate('scopeDocuments.uploadedBy', 'name email role');
 
     if (!project) {
       return res.status(404).json({ success: false, message: 'Project not found' });
@@ -56,6 +57,21 @@ exports.getProjectById = async (req, res) => {
     // Role-based filtering of sensitive credentials
     const projectObj = project.toObject();
     const userRole = req.user ? req.user.role : 'Team Member';
+
+    // Auto-migrate/populate scopeDocuments if legacy scopeDocument exists but scopeDocuments array is empty
+    if ((!projectObj.scopeDocuments || projectObj.scopeDocuments.length === 0) && projectObj.scopeDocument?.fileName) {
+      projectObj.scopeDocuments = [{
+        _id: projectObj._id + '_scope_0',
+        title: projectObj.scopeDocument.originalName || projectObj.scopeDocument.fileName,
+        fileName: projectObj.scopeDocument.fileName,
+        originalName: projectObj.scopeDocument.originalName || projectObj.scopeDocument.fileName,
+        fileUrl: projectObj.scopeDocument.fileUrl,
+        fileType: projectObj.scopeDocument.fileType || 'application/pdf',
+        fileSize: projectObj.scopeDocument.fileSize || 0,
+        uploadedAt: projectObj.scopeDocument.uploadedAt || new Date(),
+        summary: projectObj.scopeDocument.summary || '',
+      }];
+    }
 
     if (projectObj.credentials && projectObj.credentials.length > 0) {
       projectObj.credentials = projectObj.credentials.filter((cred) => {
@@ -121,7 +137,7 @@ exports.deleteProject = async (req, res) => {
   }
 };
 
-// @desc    Upload project scope document
+// @desc    Upload project scope document (supports multiple documents)
 // @route   POST /api/projects/:id/scope
 exports.uploadScopeDocument = async (req, res) => {
   try {
@@ -138,7 +154,8 @@ exports.uploadScopeDocument = async (req, res) => {
     const baseName = path.basename(req.file.originalname, ext).replace(/[^a-zA-Z0-9_-]/g, '_');
     const filename = `${Date.now()}-${baseName}${ext}`;
 
-    project.scopeDocument = {
+    const newDoc = {
+      title: req.body.title || req.file.originalname.replace(ext, '').replace(/[-_]/g, ' '),
       fileName: filename,
       originalName: req.file.originalname,
       fileUrl: `/uploads/scopes/${filename}`,
@@ -146,19 +163,98 @@ exports.uploadScopeDocument = async (req, res) => {
       fileSize: req.file.size,
       fileData: req.file.buffer.toString('base64'), // Persistent in MongoDB Atlas across all Vercel instances
       uploadedAt: new Date(),
+      uploadedBy: req.user ? req.user.id : null,
       summary: req.body.summary || `Scope document uploaded on ${new Date().toLocaleDateString()}`,
+    };
+
+    if (!project.scopeDocuments) {
+      project.scopeDocuments = [];
+    }
+    project.scopeDocuments.push(newDoc);
+
+    // Keep legacy single scopeDocument synchronized for backward compatibility
+    project.scopeDocument = {
+      fileName: newDoc.fileName,
+      originalName: newDoc.originalName,
+      fileUrl: newDoc.fileUrl,
+      fileType: newDoc.fileType,
+      fileSize: newDoc.fileSize,
+      fileData: newDoc.fileData,
+      uploadedAt: newDoc.uploadedAt,
+      summary: newDoc.summary,
     };
 
     await project.save();
 
     // Return response without huge fileData payload
-    const scopeDocResponse = { ...project.scopeDocument.toObject() };
-    delete scopeDocResponse.fileData;
+    const scopeDocsResponse = project.scopeDocuments.map((doc) => {
+      const d = doc.toObject ? doc.toObject() : { ...doc };
+      delete d.fileData;
+      return d;
+    });
 
     res.json({
       success: true,
       message: 'Scope document uploaded successfully',
-      scopeDocument: scopeDocResponse,
+      scopeDocuments: scopeDocsResponse,
+      scopeDocument: scopeDocsResponse[scopeDocsResponse.length - 1],
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Delete a scope document
+// @route   DELETE /api/projects/:id/scope/:scopeId
+exports.deleteScopeDocument = async (req, res) => {
+  try {
+    const project = await Project.findById(req.params.id);
+    if (!project) {
+      return res.status(404).json({ success: false, message: 'Project not found' });
+    }
+
+    project.scopeDocuments = (project.scopeDocuments || []).filter(
+      (doc) => doc._id.toString() !== req.params.scopeId
+    );
+
+    // If legacy scopeDocument matched this deleted doc, update or clear it
+    if (project.scopeDocuments.length > 0) {
+      const latest = project.scopeDocuments[project.scopeDocuments.length - 1];
+      project.scopeDocument = {
+        fileName: latest.fileName,
+        originalName: latest.originalName,
+        fileUrl: latest.fileUrl,
+        fileType: latest.fileType,
+        fileSize: latest.fileSize,
+        fileData: latest.fileData,
+        uploadedAt: latest.uploadedAt,
+        summary: latest.summary,
+      };
+    } else {
+      project.scopeDocument = {
+        fileName: '',
+        originalName: '',
+        fileUrl: '',
+        fileType: 'application/pdf',
+        fileSize: 0,
+        uploadedAt: new Date(),
+        summary: '',
+        fileData: '',
+      };
+    }
+
+    await project.save();
+
+    const scopeDocsResponse = project.scopeDocuments.map((doc) => {
+      const d = doc.toObject ? doc.toObject() : { ...doc };
+      delete d.fileData;
+      return d;
+    });
+
+    res.json({
+      success: true,
+      message: 'Scope document removed successfully',
+      scopeDocuments: scopeDocsResponse,
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });

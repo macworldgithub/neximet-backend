@@ -75,6 +75,50 @@ const resourceAllocationSchema = new mongoose.Schema({
   },
 });
 
+const scopeDocumentSchema = new mongoose.Schema({
+  title: {
+    type: String,
+    default: '',
+    trim: true,
+  },
+  fileName: {
+    type: String,
+    required: true,
+  },
+  originalName: {
+    type: String,
+    required: true,
+  },
+  fileUrl: {
+    type: String,
+    required: true,
+  },
+  fileType: {
+    type: String,
+    default: 'application/pdf',
+  },
+  fileSize: {
+    type: Number,
+    default: 0,
+  },
+  uploadedAt: {
+    type: Date,
+    default: Date.now,
+  },
+  uploadedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+  },
+  summary: {
+    type: String,
+    default: '',
+  },
+  fileData: {
+    type: String,
+    default: '',
+  },
+}, { timestamps: true });
+
 const projectSchema = new mongoose.Schema({
   title: {
     type: String,
@@ -117,7 +161,9 @@ const projectSchema = new mongoose.Schema({
     enum: ['Low', 'Medium', 'High', 'Critical'],
     default: 'Medium',
   },
-  // Scope Document Information
+  // Multiple Scope Documents
+  scopeDocuments: [scopeDocumentSchema],
+  // Scope Document Information (Single/Latest reference)
   scopeDocument: {
     fileName: { type: String, default: '' },
     originalName: { type: String, default: '' },
