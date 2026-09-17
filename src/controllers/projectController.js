@@ -29,6 +29,7 @@ exports.getProjects = async (req, res) => {
     }
 
     const projects = await Project.find(filter)
+      .select('-scopeDocument.fileData')
       .populate('projectManager', 'name email')
       .populate('assignedMembers.user', 'name email department designation')
       .sort({ updatedAt: -1 });
@@ -44,6 +45,7 @@ exports.getProjects = async (req, res) => {
 exports.getProjectById = async (req, res) => {
   try {
     const project = await Project.findById(req.params.id)
+      .select('-scopeDocument.fileData')
       .populate('projectManager', 'name email role phone')
       .populate('assignedMembers.user', 'name email department designation baseSalary dailyWage');
 
@@ -128,26 +130,35 @@ exports.uploadScopeDocument = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Project not found' });
     }
 
-    if (!req.file) {
+    if (!req.file || !req.file.buffer) {
       return res.status(400).json({ success: false, message: 'Please upload a document file' });
     }
 
+    const ext = path.extname(req.file.originalname);
+    const baseName = path.basename(req.file.originalname, ext).replace(/[^a-zA-Z0-9_-]/g, '_');
+    const filename = `${Date.now()}-${baseName}${ext}`;
+
     project.scopeDocument = {
-      fileName: req.file.filename,
+      fileName: filename,
       originalName: req.file.originalname,
-      fileUrl: `/uploads/scopes/${req.file.filename}`,
-      fileType: req.file.mimetype,
+      fileUrl: `/uploads/scopes/${filename}`,
+      fileType: req.file.mimetype || 'application/pdf',
       fileSize: req.file.size,
+      fileData: req.file.buffer.toString('base64'), // Persistent in MongoDB Atlas across all Vercel instances
       uploadedAt: new Date(),
       summary: req.body.summary || `Scope document uploaded on ${new Date().toLocaleDateString()}`,
     };
 
     await project.save();
 
+    // Return response without huge fileData payload
+    const scopeDocResponse = { ...project.scopeDocument.toObject() };
+    delete scopeDocResponse.fileData;
+
     res.json({
       success: true,
       message: 'Scope document uploaded successfully',
-      scopeDocument: project.scopeDocument,
+      scopeDocument: scopeDocResponse,
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });

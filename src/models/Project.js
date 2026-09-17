@@ -126,6 +126,7 @@ const projectSchema = new mongoose.Schema({
     fileSize: { type: Number, default: 0 },
     uploadedAt: { type: Date, default: Date.now },
     summary: { type: String, default: '' },
+    fileData: { type: String, default: '' }, // Base64 encoded document content for serverless persistence
   },
   // Credentials Vault
   credentials: [projectCredentialSchema],
