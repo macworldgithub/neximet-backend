@@ -107,3 +107,96 @@ exports.getStats = async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 };
+
+// @desc    Get consolidated administrative notifications for CEO / Super Admin
+// @route   GET /api/dashboard/admin-notifications
+exports.getAdminNotifications = async (req, res) => {
+  try {
+    const todayStr = getTodayString();
+    const Task = require('../models/Task');
+
+    // 1. Pending Leaves
+    const pendingLeaves = await LeaveRequest.find({ status: 'pending' })
+      .populate('user', 'name email department designation')
+      .sort({ createdAt: -1 });
+
+    // 2. Pending Password Reset Requests
+    const passwordUsers = await User.find({ 'passwordResetRequest.status': 'Pending' })
+      .select('name email role department designation phone passwordResetRequest updatedAt')
+      .sort({ 'passwordResetRequest.requestedAt': -1 });
+
+    const pendingPasswords = passwordUsers.map((u) => ({
+      _id: u._id,
+      user: {
+        _id: u._id,
+        name: u.name,
+        email: u.email,
+        role: u.role,
+        department: u.department,
+        designation: u.designation,
+      },
+      name: u.name,
+      email: u.email,
+      role: u.role,
+      department: u.department,
+      requestedAt: u.passwordResetRequest?.requestedAt || u.updatedAt,
+    }));
+
+    // 3. Today's Attendance Discrepancies (late check-ins >= 10 mins)
+    const lateToday = await Attendance.find({
+      date: todayStr,
+      isLate: true,
+      minutesLate: { $gte: 10 },
+    })
+      .populate('user', 'name email department designation')
+      .sort({ minutesLate: -1 });
+
+    const attendanceAlerts = lateToday.map((a) => ({
+      _id: a._id,
+      user: a.user,
+      name: a.user?.name || 'Staff Member',
+      email: a.user?.email || '',
+      department: a.user?.department || '',
+      minutesLate: a.minutesLate,
+      deductionAmount: a.deductionAmount,
+      checkIn: a.checkIn,
+    }));
+
+    // 4. Urgent Tasks & Reviews
+    const taskAlerts = await Task.find({
+      $or: [
+        { status: 'review' },
+        { priority: 'Urgent', status: { $ne: 'done' } },
+      ],
+    })
+      .populate('project', 'title code')
+      .populate('assignedTo', 'name email department')
+      .sort({ updatedAt: -1 })
+      .limit(6);
+
+    const totalCount =
+      pendingLeaves.length +
+      pendingPasswords.length +
+      attendanceAlerts.length +
+      taskAlerts.length;
+
+    res.json({
+      success: true,
+      totalCount,
+      counts: {
+        leaves: pendingLeaves.length,
+        passwords: pendingPasswords.length,
+        attendance: attendanceAlerts.length,
+        tasks: taskAlerts.length,
+      },
+      notifications: {
+        leaves: pendingLeaves,
+        passwords: pendingPasswords,
+        attendance: attendanceAlerts,
+        tasks: taskAlerts,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
