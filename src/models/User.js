@@ -22,7 +22,7 @@ const userSchema = new mongoose.Schema({
   },
   role: {
     type: String,
-    enum: ['CEO', 'Project Manager', 'Team Manager', 'Team Member'],
+    enum: ['CEO', 'Super Admin', 'Project Manager', 'Team Manager', 'Team Member'],
     default: 'Team Member',
   },
   department: {
@@ -64,6 +64,23 @@ const userSchema = new mongoose.Schema({
   isActive: {
     type: Boolean,
     default: true,
+  },
+  passwordResetRequest: {
+    status: {
+      type: String,
+      enum: ['None', 'Pending', 'Completed', 'Rejected'],
+      default: 'None',
+    },
+    requestedAt: {
+      type: Date,
+    },
+    resolvedAt: {
+      type: Date,
+    },
+    resolvedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+    },
   },
 }, { timestamps: true });
 
