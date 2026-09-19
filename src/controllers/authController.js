@@ -84,7 +84,10 @@ exports.getAllUsers = async (req, res) => {
     if (department && department !== 'All') filter.department = department;
     if (role && role !== 'All') filter.role = role;
 
-    const users = await User.find(filter).select('-password').sort({ name: 1 });
+    const users = await User.find(filter)
+      .select('-password')
+      .populate('reportsTo', 'name email role designation')
+      .sort({ name: 1 });
     res.json({ success: true, count: users.length, users });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -107,6 +110,7 @@ exports.createEmployee = async (req, res) => {
       phone,
       joinDate,
       leaveBalances,
+      reportsTo,
     } = req.body;
 
     if (!name || !email || !password || !department) {
@@ -131,8 +135,8 @@ exports.createEmployee = async (req, res) => {
       });
     }
 
-    const salary = Number(baseSalary) || 120000;
-    const wage = Number(dailyWage) || Math.round(salary / 30);
+    const salary = (baseSalary !== undefined && baseSalary !== null && baseSalary !== '') ? Number(baseSalary) : null;
+    const wage = (dailyWage !== undefined && dailyWage !== null && dailyWage !== '') ? Number(dailyWage) : (salary ? Math.round(salary / 30) : null);
     const leaves = leaveBalances || { casual: 10, sick: 8, annual: 14 };
 
     const newUser = await User.create({
@@ -147,6 +151,7 @@ exports.createEmployee = async (req, res) => {
       phone: phone || '+92 (300) 123-4567',
       joinDate: joinDate ? new Date(joinDate) : new Date(),
       leaveBalances: leaves,
+      reportsTo: reportsTo || null,
     });
 
     const userObj = newUser.toObject();
@@ -156,6 +161,75 @@ exports.createEmployee = async (req, res) => {
       success: true,
       message: 'Employee created successfully.',
       user: userObj,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Update employee profile & salary (CEO / Super Admin only)
+// @route   PUT /api/auth/users/:id
+exports.updateUser = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const user = await User.findById(id);
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'Employee not found.' });
+    }
+
+    const {
+      name,
+      role,
+      department,
+      designation,
+      baseSalary,
+      dailyWage,
+      phone,
+      leaveBalances,
+      reportsTo,
+      isActive,
+    } = req.body;
+
+    if (name) user.name = name.trim();
+    if (role) user.role = role;
+    if (department) user.department = department;
+    if (designation) user.designation = designation.trim();
+    if (phone) user.phone = phone.trim();
+    if (typeof isActive === 'boolean') user.isActive = isActive;
+
+    if (baseSalary !== undefined) {
+      user.baseSalary = (baseSalary === null || baseSalary === '') ? null : Number(baseSalary);
+    }
+
+    if (dailyWage !== undefined) {
+      user.dailyWage = (dailyWage === null || dailyWage === '') ? null : Number(dailyWage);
+    } else if (user.baseSalary && !user.dailyWage) {
+      user.dailyWage = Math.round(user.baseSalary / 30);
+    }
+
+    if (leaveBalances) {
+      user.leaveBalances = {
+        casual: Number(leaveBalances.casual) >= 0 ? Number(leaveBalances.casual) : (user.leaveBalances?.casual ?? 10),
+        sick: Number(leaveBalances.sick) >= 0 ? Number(leaveBalances.sick) : (user.leaveBalances?.sick ?? 8),
+        annual: Number(leaveBalances.annual) >= 0 ? Number(leaveBalances.annual) : (user.leaveBalances?.annual ?? 14),
+      };
+    }
+
+    if (reportsTo !== undefined) {
+      user.reportsTo = reportsTo || null;
+    }
+
+    await user.save();
+
+    const updatedUser = await User.findById(id)
+      .select('-password')
+      .populate('reportsTo', 'name email role designation');
+
+    res.json({
+      success: true,
+      message: 'Employee updated successfully.',
+      user: updatedUser,
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });

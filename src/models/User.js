@@ -42,11 +42,16 @@ const userSchema = new mongoose.Schema({
   },
   baseSalary: {
     type: Number,
-    default: 120000,
+    default: null,
   },
   dailyWage: {
     type: Number,
-    default: 4000,
+    default: null,
+  },
+  reportsTo: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null,
   },
   phone: {
     type: String,
