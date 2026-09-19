@@ -207,13 +207,13 @@ const seedRealDatabase = async () => {
         phone: '+92 (306) 444-3002',
       },
 
-      // Graphics Designing Team (Single member)
+      // Graphics Designing Team (Single member - Project Manager)
       {
         email: 'idrees@neximet.com',
         name: 'Idrees',
-        role: 'Team Member',
+        role: 'Project Manager',
         department: 'Graphics Designing',
-        designation: 'Lead Graphic Designer',
+        designation: 'Graphics Project Manager',
         password: 'idrees@123',
         phone: '+92 (314) 555-4001',
       },
@@ -408,7 +408,7 @@ const seedRealDatabase = async () => {
         budget: 1800000,
         estimatedHours: 200,
         spentHours: 155,
-        projectManager: userByEmail['jawwad@neximet.com']._id,
+        projectManager: userByEmail['idrees@neximet.com']._id,
         scopeDocument: {
           fileName: 'NX-GD-02-brand-guide.pdf',
           originalName: 'Neximet-Brand-Identity-V3.pdf',
@@ -434,7 +434,7 @@ const seedRealDatabase = async () => {
           { title: 'Asset Export & Developer Hand-off', deadline: new Date('2026-10-10'), status: 'pending', progress: 20 },
         ],
         assignedMembers: [
-          { user: userByEmail['idrees@neximet.com']._id, roleInProject: 'Lead Graphic Designer', allocatedHoursPerWeek: 40 },
+          { user: userByEmail['idrees@neximet.com']._id, roleInProject: 'Graphics Project Manager', allocatedHoursPerWeek: 40 },
         ],
       },
       {
@@ -1028,8 +1028,8 @@ const seedRealDatabase = async () => {
     console.log('SEO Team (Equal Project Managers):');
     console.log(' - ammar@neximet.com       | ammar@123   (Ammar Siddiqui)');
     console.log(' - jawad@neximet.com       | jawad@123   (Jawad)\n');
-    console.log('Graphics Designing Team (Single Member):');
-    console.log(' - idrees@neximet.com      | idrees@123  (Idrees - Lead Designer)\n');
+    console.log('Graphics Designing Team (Project Manager):');
+    console.log(' - idrees@neximet.com      | idrees@123  (Idrees - Graphics Project Manager)\n');
     console.log('Configuration Notes:');
     console.log(' - Salaries: baseSalary = null, dailyWage = null (CEO will edit)');
     console.log(' - Leaves: casual: 10, sick: 8, annual: 14 (Same for all)');
