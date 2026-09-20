@@ -54,6 +54,28 @@ const deductionRuleSchema = new mongoose.Schema({
     type: String,
     default: 'PKR',
   },
+  officeLocation: {
+    officeAddress: {
+      type: String,
+      default: 'Neximet Head Office, Karachi',
+    },
+    latitude: {
+      type: Number,
+      default: 24.8607,
+    },
+    longitude: {
+      type: Number,
+      default: 67.0011,
+    },
+    radiusMeters: {
+      type: Number,
+      default: 200, // Allowed geofence boundary in meters
+    },
+    enforceLocation: {
+      type: Boolean,
+      default: true, // If true, check-in requires within office geofence
+    },
+  },
   isActive: {
     type: Boolean,
     default: true,

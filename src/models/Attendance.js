@@ -45,6 +45,13 @@ const attendanceSchema = new mongoose.Schema({
     type: String,
     default: '',
   },
+  location: {
+    latitude: { type: Number, default: null },
+    longitude: { type: Number, default: null },
+    distanceMeters: { type: Number, default: null },
+    isVerified: { type: Boolean, default: false },
+    officeAddress: { type: String, default: '' },
+  },
   ipAddress: {
     type: String,
     default: '127.0.0.1',

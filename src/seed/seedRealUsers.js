@@ -285,6 +285,13 @@ const seedRealDatabase = async () => {
       consecutiveLateThreshold: 3,
       consecutivePenaltyMultiplier: 1.5,
       currencySymbol: 'PKR',
+      officeLocation: {
+        officeAddress: 'Neximet Head Office, Karachi',
+        latitude: 24.8607,
+        longitude: 67.0011,
+        radiusMeters: 200,
+        enforceLocation: true,
+      },
       isActive: true,
       updatedBy: ceoTalhaId,
     });

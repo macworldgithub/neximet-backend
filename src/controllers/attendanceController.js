@@ -10,6 +10,22 @@ const getTodayString = (date = new Date()) => {
   return `${year}-${month}-${day}`;
 };
 
+// Helper: Calculate Haversine distance in meters between two GPS coordinates
+const calculateDistanceMeters = (lat1, lon1, lat2, lon2) => {
+  const R = 6371e3; // Earth's radius in meters
+  const phi1 = (lat1 * Math.PI) / 180;
+  const phi2 = (lat2 * Math.PI) / 180;
+  const deltaPhi = ((lat2 - lat1) * Math.PI) / 180;
+  const deltaLambda = ((lon2 - lon1) * Math.PI) / 180;
+
+  const a =
+    Math.sin(deltaPhi / 2) * Math.sin(deltaPhi / 2) +
+    Math.cos(phi1) * Math.cos(phi2) * Math.sin(deltaLambda / 2) * Math.sin(deltaLambda / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+  return Math.round(R * c);
+};
+
 // Helper: Calculate late minutes and deduction
 const calculateLateAndDeductions = async (checkInDate, user, customRule = null) => {
   const rule = customRule || (await DeductionRule.findOne({ isActive: true })) || {
@@ -105,12 +121,12 @@ const calculateLateAndDeductions = async (checkInDate, user, customRule = null) 
 exports.checkIn = async (req, res) => {
   try {
     const user = await User.findById(req.user.id);
-    const { customTime, notes } = req.body; // allows testing simulated check-in time
+    const { customTime, notes, latitude, longitude, bypassGeofence } = req.body;
 
     const checkInDate = customTime ? new Date(customTime) : new Date();
     const todayStr = getTodayString(checkInDate);
 
-    // Check if already checked in today
+    // 1. Check if already checked in today
     let record = await Attendance.findOne({ user: user._id, date: todayStr });
     if (record && record.checkIn) {
       return res.status(400).json({
@@ -120,7 +136,82 @@ exports.checkIn = async (req, res) => {
       });
     }
 
-    const lateCalc = await calculateLateAndDeductions(checkInDate, user);
+    // 2. Fetch active policy and office location rules
+    const rule = (await DeductionRule.findOne({ isActive: true })) || {
+      shiftStartTime: '09:00',
+      gracePeriodMinutes: 15,
+      lateThresholdMinutes: 30,
+      officeLocation: {
+        officeAddress: 'Neximet Head Office, Karachi',
+        latitude: 24.8607,
+        longitude: 67.0011,
+        radiusMeters: 200,
+        enforceLocation: true,
+      },
+    };
+
+    const officeLoc = rule.officeLocation || {
+      officeAddress: 'Neximet Head Office, Karachi',
+      latitude: 24.8607,
+      longitude: 67.0011,
+      radiusMeters: 200,
+      enforceLocation: true,
+    };
+
+    let locationData = {
+      latitude: latitude !== undefined && latitude !== null ? Number(latitude) : null,
+      longitude: longitude !== undefined && longitude !== null ? Number(longitude) : null,
+      distanceMeters: null,
+      isVerified: false,
+      officeAddress: officeLoc.officeAddress || 'Neximet Head Office',
+    };
+
+    // 3. Geofence Verification (Ensure employee is physically at the office)
+    if (officeLoc.enforceLocation && !bypassGeofence) {
+      if (latitude === undefined || longitude === undefined || latitude === null || longitude === null) {
+        return res.status(400).json({
+          success: false,
+          message: 'Location verification required: Please enable device location/GPS to check in from the office premises.',
+          officeLocation: officeLoc,
+        });
+      }
+
+      const userLat = Number(latitude);
+      const userLng = Number(longitude);
+
+      if (isNaN(userLat) || isNaN(userLng)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid GPS coordinates received for location verification.',
+        });
+      }
+
+      const distanceMeters = calculateDistanceMeters(
+        userLat,
+        userLng,
+        officeLoc.latitude,
+        officeLoc.longitude
+      );
+
+      locationData.distanceMeters = distanceMeters;
+
+      if (distanceMeters > officeLoc.radiusMeters) {
+        return res.status(403).json({
+          success: false,
+          message: `Check-in rejected: You are ${distanceMeters}m away from the office (${officeLoc.officeAddress}). Check-in is only allowed within ${officeLoc.radiusMeters}m radius of the office.`,
+          distanceMeters,
+          allowedRadius: officeLoc.radiusMeters,
+          officeAddress: officeLoc.officeAddress,
+          isOutOfOffice: true,
+        });
+      }
+
+      locationData.isVerified = true;
+    } else {
+      locationData.isVerified = true;
+    }
+
+    const lateCalc = await calculateLateAndDeductions(checkInDate, user, rule);
 
     if (!record) {
       record = new Attendance({
@@ -133,6 +224,7 @@ exports.checkIn = async (req, res) => {
         deductionAmount: lateCalc.deductionAmount,
         deductionPercentage: lateCalc.deductionPercentage,
         deductionReason: lateCalc.deductionReason,
+        location: locationData,
         notes: notes || '',
         ipAddress: req.ip || '127.0.0.1',
       });
@@ -144,6 +236,7 @@ exports.checkIn = async (req, res) => {
       record.deductionAmount = lateCalc.deductionAmount;
       record.deductionPercentage = lateCalc.deductionPercentage;
       record.deductionReason = lateCalc.deductionReason;
+      record.location = locationData;
       if (notes) record.notes = notes;
     }
 
@@ -151,8 +244,11 @@ exports.checkIn = async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: record.isLate ? `Checked in with late mark (${record.minutesLate} mins late)` : 'Checked in on time!',
+      message: record.isLate
+        ? `Checked in with late mark (${record.minutesLate} mins late) [Office Location Verified]`
+        : 'Checked in on time! [Office Location Verified]',
       attendance: record,
+      distanceFromOffice: locationData.distanceMeters,
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -196,10 +292,20 @@ exports.getTodayStatus = async (req, res) => {
     const todayStr = getTodayString();
     const record = await Attendance.findOne({ user: req.user.id, date: todayStr });
     const user = await User.findById(req.user.id);
+    const rule = await DeductionRule.findOne({ isActive: true });
+
+    const officeLocation = rule?.officeLocation || {
+      officeAddress: 'Neximet Head Office, Karachi',
+      latitude: 24.8607,
+      longitude: 67.0011,
+      radiusMeters: 200,
+      enforceLocation: true,
+    };
 
     res.json({
       success: true,
       attendance: record,
+      officeLocation,
       leaveBalances: user ? user.leaveBalances : { casual: 0, sick: 0, annual: 0 },
       dailyWage: user ? user.dailyWage : 4000,
     });
