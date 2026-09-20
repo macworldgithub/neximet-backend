@@ -9,9 +9,17 @@ exports.getProjects = async (req, res) => {
     const { department, status, search } = req.query;
     const filter = {};
 
-    if (department && department !== 'All') {
+    const isExecutive = ['CEO', 'Super Admin'].includes(req.user?.role);
+
+    // Non-CEO/Super Admin can only see projects belonging to their particular team's department
+    if (!isExecutive) {
+      if (req.user?.department && req.user.department !== 'Executive') {
+        filter.department = req.user.department;
+      }
+    } else if (department && department !== 'All') {
       filter.department = department;
     }
+
     if (status && status !== 'All') {
       filter.status = status;
     }
@@ -21,11 +29,6 @@ exports.getProjects = async (req, res) => {
         { code: { $regex: search, $options: 'i' } },
         { clientName: { $regex: search, $options: 'i' } },
       ];
-    }
-
-    // If Team Member, let them see projects in their department or projects they're assigned to
-    if (req.user && req.user.role === 'Team Member') {
-      // Allow viewing all projects for company visibility, or highlight assignment
     }
 
     const projects = await Project.find(filter)
@@ -52,6 +55,23 @@ exports.getProjectById = async (req, res) => {
 
     if (!project) {
       return res.status(404).json({ success: false, message: 'Project not found' });
+    }
+
+    // Role-based department restriction for non-CEOs/Super Admins
+    const isExecutive = ['CEO', 'Super Admin'].includes(req.user?.role);
+    if (!isExecutive && req.user?.department && req.user.department !== 'Executive') {
+      const isSameDept = project.department === req.user.department;
+      const isAssigned = project.assignedMembers?.some(
+        (m) => (m.user?._id || m.user)?.toString() === req.user.id.toString()
+      );
+      const isPM = (project.projectManager?._id || project.projectManager)?.toString() === req.user.id.toString();
+
+      if (!isSameDept && !isAssigned && !isPM) {
+        return res.status(403).json({
+          success: false,
+          message: 'Access denied: You can only access projects of your particular team.',
+        });
+      }
     }
 
     // Role-based filtering of sensitive credentials

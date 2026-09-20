@@ -76,7 +76,8 @@ exports.getLeaveRequests = async (req, res) => {
     const { status } = req.query;
     const filter = {};
 
-    if (req.user.role === 'Team Member') {
+    const isExecutive = ['CEO', 'Super Admin'].includes(req.user.role);
+    if (!isExecutive) {
       filter.user = req.user.id;
     }
 

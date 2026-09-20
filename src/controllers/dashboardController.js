@@ -18,8 +18,14 @@ exports.getStats = async (req, res) => {
     const todayStr = getTodayString();
     const currentMonthPrefix = todayStr.substring(0, 7);
 
-    // 1. Projects Statistics
-    const allProjects = await Project.find().select('title code department status completionPercentage deadline clientName priority');
+    const isExecutive = ['CEO', 'Super Admin'].includes(req.user?.role);
+
+    // 1. Projects Statistics (Scoped for non-executives)
+    const projectFilter = (!isExecutive && req.user?.department && req.user.department !== 'Executive')
+      ? { department: req.user.department }
+      : {};
+
+    const allProjects = await Project.find(projectFilter).select('title code department status completionPercentage deadline clientName priority');
     const totalProjects = allProjects.length;
     const activeProjects = allProjects.filter((p) => p.status === 'in_progress').length;
     const completedProjects = allProjects.filter((p) => p.status === 'completed').length;
@@ -27,14 +33,18 @@ exports.getStats = async (req, res) => {
     const planningProjects = allProjects.filter((p) => p.status === 'planning').length;
 
     // Department-wise project counts & completion averages
-    const departments = [
+    const allDepartments = [
       'Software Development',
       'Digital Marketing (SEO)',
       'Graphics Designing',
       'WordPress Team',
     ];
 
-    const departmentStats = departments.map((dept) => {
+    const displayDepartments = (!isExecutive && req.user?.department && req.user.department !== 'Executive')
+      ? [req.user.department]
+      : allDepartments;
+
+    const departmentStats = displayDepartments.map((dept) => {
       const deptProjects = allProjects.filter((p) => p.department === dept);
       const count = deptProjects.length;
       const avgProgress = count > 0
@@ -77,8 +87,10 @@ exports.getStats = async (req, res) => {
       .sort((a, b) => new Date(a.deadline) - new Date(b.deadline))
       .slice(0, 5);
 
-    // 6. Pending Leave Approvals
-    const pendingLeavesCount = await LeaveRequest.countDocuments({ status: 'pending' });
+    // 6. Pending Leave Approvals (Only visible to CEOs / Super Admins)
+    const pendingLeavesCount = isExecutive
+      ? await LeaveRequest.countDocuments({ status: 'pending' })
+      : 0;
 
     res.json({
       success: true,

@@ -215,8 +215,9 @@ exports.getHistory = async (req, res) => {
     const { userId, month, department, status } = req.query;
     const filter = {};
 
-    // Non-CEO/Manager can only view their own
-    if (req.user.role === 'Team Member') {
+    // Non-CEO/Super Admin can only view their own
+    const isExecutive = ['CEO', 'Super Admin'].includes(req.user.role);
+    if (!isExecutive) {
       filter.user = req.user.id;
     } else if (userId && userId !== 'all') {
       filter.user = userId;

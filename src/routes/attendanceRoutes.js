@@ -16,6 +16,6 @@ router.post('/check-in', checkIn);
 router.post('/check-out', checkOut);
 router.get('/today', getTodayStatus);
 router.get('/history', getHistory);
-router.get('/roster', authorize('CEO', 'Project Manager', 'Team Manager'), getDailyRoster);
+router.get('/roster', authorize('CEO', 'Super Admin'), getDailyRoster);
 
 module.exports = router;
