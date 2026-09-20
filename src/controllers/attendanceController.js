@@ -117,11 +117,10 @@ const calculateLateAndDeductions = async (checkInDate, user, customRule = null) 
 };
 
 // @desc    Mark Check-In
-// @route   POST /api/attendance/check-in
 exports.checkIn = async (req, res) => {
   try {
     const user = await User.findById(req.user.id);
-    const { customTime, notes, latitude, longitude, bypassGeofence } = req.body;
+    const { customTime, notes, latitude, longitude, bypassGeofence, deviceId, deviceType, browser, photo } = req.body;
 
     const checkInDate = customTime ? new Date(customTime) : new Date();
     const todayStr = getTodayString(checkInDate);
@@ -136,7 +135,7 @@ exports.checkIn = async (req, res) => {
       });
     }
 
-    // 2. Fetch active policy and office location rules
+    // 2. Fetch active policy, office location rules, and anti-proxy settings
     const rule = (await DeductionRule.findOne({ isActive: true })) || {
       shiftStartTime: '09:00',
       gracePeriodMinutes: 15,
@@ -148,7 +147,44 @@ exports.checkIn = async (req, res) => {
         radiusMeters: 200,
         enforceLocation: true,
       },
+      antiProxySettings: {
+        enforceSingleDevicePerDay: true,
+        requireSelfieVerification: true,
+      },
     };
+
+    const antiProxy = rule.antiProxySettings || {
+      enforceSingleDevicePerDay: true,
+      requireSelfieVerification: true,
+    };
+
+    // 3. Anti-Proxy Verification: Device Fingerprint Lockout
+    // Prevents an employee who arrives early from clocking in for their peers from the same physical device/browser
+    if (antiProxy.enforceSingleDevicePerDay && deviceId) {
+      const conflictingAttendance = await Attendance.findOne({
+        date: todayStr,
+        'deviceInfo.deviceId': deviceId,
+        user: { $ne: user._id },
+      }).populate('user', 'name email');
+
+      if (conflictingAttendance) {
+        return res.status(403).json({
+          success: false,
+          message: `Anti-Proxy Security Alert: This physical device has already been used to clock in for another employee (${conflictingAttendance.user?.name || 'Another User'}) today. Multiple employee check-ins from the same device are strictly prohibited to prevent buddy-punching.`,
+          isProxyBlocked: true,
+          conflictingUser: conflictingAttendance.user?.name,
+        });
+      }
+    }
+
+    // 4. Anti-Proxy Verification: Live Selfie Photo
+    if (antiProxy.requireSelfieVerification && !photo) {
+      return res.status(400).json({
+        success: false,
+        message: 'Selfie verification required: A live webcam photo snapshot must be captured to verify your physical presence and identity.',
+        requireSelfie: true,
+      });
+    }
 
     const officeLoc = rule.officeLocation || {
       officeAddress: 'Neximet Head Office, Karachi',
@@ -166,7 +202,7 @@ exports.checkIn = async (req, res) => {
       officeAddress: officeLoc.officeAddress || 'Neximet Head Office',
     };
 
-    // 3. Geofence Verification (Ensure employee is physically at the office)
+    // 5. Geofence Verification (Ensure employee is physically at the office)
     if (officeLoc.enforceLocation && !bypassGeofence) {
       if (latitude === undefined || longitude === undefined || latitude === null || longitude === null) {
         return res.status(400).json({
@@ -213,6 +249,13 @@ exports.checkIn = async (req, res) => {
 
     const lateCalc = await calculateLateAndDeductions(checkInDate, user, rule);
 
+    const deviceInfoData = {
+      deviceId: deviceId || '',
+      deviceType: deviceType || 'Desktop/Browser',
+      browser: browser || '',
+      userAgent: req.headers['user-agent'] || '',
+    };
+
     if (!record) {
       record = new Attendance({
         user: user._id,
@@ -225,6 +268,8 @@ exports.checkIn = async (req, res) => {
         deductionPercentage: lateCalc.deductionPercentage,
         deductionReason: lateCalc.deductionReason,
         location: locationData,
+        deviceInfo: deviceInfoData,
+        photo: photo || '',
         notes: notes || '',
         ipAddress: req.ip || '127.0.0.1',
       });
@@ -237,6 +282,8 @@ exports.checkIn = async (req, res) => {
       record.deductionPercentage = lateCalc.deductionPercentage;
       record.deductionReason = lateCalc.deductionReason;
       record.location = locationData;
+      record.deviceInfo = deviceInfoData;
+      if (photo) record.photo = photo;
       if (notes) record.notes = notes;
     }
 
@@ -245,8 +292,8 @@ exports.checkIn = async (req, res) => {
     res.status(201).json({
       success: true,
       message: record.isLate
-        ? `Checked in with late mark (${record.minutesLate} mins late) [Office Location Verified]`
-        : 'Checked in on time! [Office Location Verified]',
+        ? `Checked in with late mark (${record.minutesLate} mins late) [Office Location & Anti-Proxy Verified]`
+        : 'Checked in on time! [Office Location & Anti-Proxy Verified]',
       attendance: record,
       distanceFromOffice: locationData.distanceMeters,
     });
@@ -302,10 +349,16 @@ exports.getTodayStatus = async (req, res) => {
       enforceLocation: true,
     };
 
+    const antiProxySettings = rule?.antiProxySettings || {
+      enforceSingleDevicePerDay: true,
+      requireSelfieVerification: true,
+    };
+
     res.json({
       success: true,
       attendance: record,
       officeLocation,
+      antiProxySettings,
       leaveBalances: user ? user.leaveBalances : { casual: 0, sick: 0, annual: 0 },
       dailyWage: user ? user.dailyWage : 4000,
     });
@@ -391,6 +444,9 @@ exports.getDailyRoster = async (req, res) => {
         minutesLate: rec ? rec.minutesLate : 0,
         deductionAmount: rec ? rec.deductionAmount : 0,
         totalWorkHours: rec ? rec.totalWorkHours : 0,
+        photo: rec ? rec.photo : '',
+        deviceInfo: rec ? rec.deviceInfo : null,
+        location: rec ? rec.location : null,
         notes: rec ? rec.notes : '',
       };
     });

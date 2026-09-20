@@ -52,6 +52,16 @@ const attendanceSchema = new mongoose.Schema({
     isVerified: { type: Boolean, default: false },
     officeAddress: { type: String, default: '' },
   },
+  deviceInfo: {
+    deviceId: { type: String, default: '' },
+    deviceType: { type: String, default: '' },
+    browser: { type: String, default: '' },
+    userAgent: { type: String, default: '' },
+  },
+  photo: {
+    type: String, // base64 encoded check-in selfie snapshot
+    default: '',
+  },
   ipAddress: {
     type: String,
     default: '127.0.0.1',

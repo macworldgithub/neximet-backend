@@ -76,6 +76,16 @@ const deductionRuleSchema = new mongoose.Schema({
       default: true, // If true, check-in requires within office geofence
     },
   },
+  antiProxySettings: {
+    enforceSingleDevicePerDay: {
+      type: Boolean,
+      default: true, // Blocks multiple employee check-ins from the same device/browser on the same date
+    },
+    requireSelfieVerification: {
+      type: Boolean,
+      default: true, // Requires employee to take a live photo upon check-in
+    },
+  },
   isActive: {
     type: Boolean,
     default: true,
