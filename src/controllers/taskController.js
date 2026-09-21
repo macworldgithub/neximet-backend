@@ -321,3 +321,86 @@ exports.getTimeLogsByProject = async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 };
+
+// @desc    Update time log
+// @route   PUT /api/tasks/timelogs/:id
+exports.updateTimeLog = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { hours, description, billable, date } = req.body;
+
+    const timeLog = await TimeLog.findById(id);
+    if (!timeLog) {
+      return res.status(404).json({ success: false, message: 'Time log not found' });
+    }
+
+    const isOwner = timeLog.user.toString() === req.user.id.toString();
+    const isManager = ['CEO', 'Super Admin', 'Project Manager', 'Team Manager'].includes(req.user.role);
+    if (!isOwner && !isManager) {
+      return res.status(403).json({ success: false, message: 'Not authorized to edit this time log' });
+    }
+
+    const oldHours = timeLog.hours || 0;
+    const newHours = hours !== undefined ? Number(hours) : oldHours;
+    const diff = newHours - oldHours;
+
+    timeLog.hours = newHours;
+    if (description !== undefined) timeLog.description = description;
+    if (billable !== undefined) timeLog.billable = billable;
+    if (date !== undefined) timeLog.date = date;
+
+    await timeLog.save();
+
+    // Adjust spentHours on Project and Task
+    if (diff !== 0 && timeLog.project) {
+      await Project.findByIdAndUpdate(timeLog.project, { $inc: { spentHours: diff } });
+    }
+    if (diff !== 0 && timeLog.task) {
+      await Task.findByIdAndUpdate(timeLog.task, { $inc: { spentHours: diff } });
+    }
+
+    const populated = await TimeLog.findById(timeLog._id)
+      .populate('user', 'name email designation role')
+      .populate('task', 'title issueKey');
+
+    res.json({ success: true, timeLog: populated });
+  } catch (error) {
+    res.status(400).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Delete time log
+// @route   DELETE /api/tasks/timelogs/:id
+exports.deleteTimeLog = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const timeLog = await TimeLog.findById(id);
+    if (!timeLog) {
+      return res.status(404).json({ success: false, message: 'Time log not found' });
+    }
+
+    const isOwner = timeLog.user.toString() === req.user.id.toString();
+    const isManager = ['CEO', 'Super Admin', 'Project Manager', 'Team Manager'].includes(req.user.role);
+    if (!isOwner && !isManager) {
+      return res.status(403).json({ success: false, message: 'Not authorized to delete this time log' });
+    }
+
+    const hours = timeLog.hours || 0;
+    const projectId = timeLog.project;
+    const taskId = timeLog.task;
+
+    await TimeLog.findByIdAndDelete(id);
+
+    // Decrement spentHours
+    if (hours > 0 && projectId) {
+      await Project.findByIdAndUpdate(projectId, { $inc: { spentHours: -hours } });
+    }
+    if (hours > 0 && taskId) {
+      await Task.findByIdAndUpdate(taskId, { $inc: { spentHours: -hours } });
+    }
+
+    res.json({ success: true, message: 'Time log deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
