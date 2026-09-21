@@ -21,18 +21,18 @@ router.use(protect);
 
 router.route('/')
   .get(getProjects)
-  .post(authorize('CEO', 'Project Manager'), createProject);
+  .post(authorize('CEO', 'Super Admin', 'Project Manager', 'Team Manager'), createProject);
 
 router.route('/:id')
   .get(getProjectById)
-  .put(authorize('CEO', 'Project Manager'), updateProject)
-  .delete(authorize('CEO'), deleteProject);
+  .put(authorize('CEO', 'Super Admin', 'Project Manager', 'Team Manager'), updateProject)
+  .delete(authorize('CEO', 'Super Admin'), deleteProject);
 
-router.post('/:id/scope', authorize('CEO', 'Project Manager'), upload.single('scopeFile'), uploadScopeDocument);
-router.delete('/:id/scope/:scopeId', authorize('CEO', 'Project Manager'), deleteScopeDocument);
-router.post('/:id/credentials', authorize('CEO', 'Project Manager'), addCredential);
-router.delete('/:id/credentials/:credId', authorize('CEO', 'Project Manager'), deleteCredential);
-router.put('/:id/resources', authorize('CEO', 'Project Manager', 'Team Manager'), updateResources);
-router.put('/:id/milestones', authorize('CEO', 'Project Manager'), updateMilestones);
+router.post('/:id/scope', authorize('CEO', 'Super Admin', 'Project Manager', 'Team Manager'), upload.single('scopeFile'), uploadScopeDocument);
+router.delete('/:id/scope/:scopeId', authorize('CEO', 'Super Admin', 'Project Manager', 'Team Manager'), deleteScopeDocument);
+router.post('/:id/credentials', authorize('CEO', 'Super Admin', 'Project Manager', 'Team Manager'), addCredential);
+router.delete('/:id/credentials/:credId', authorize('CEO', 'Super Admin', 'Project Manager', 'Team Manager'), deleteCredential);
+router.put('/:id/resources', authorize('CEO', 'Super Admin', 'Project Manager', 'Team Manager'), updateResources);
+router.put('/:id/milestones', authorize('CEO', 'Super Admin', 'Project Manager', 'Team Manager'), updateMilestones);
 
 module.exports = router;
