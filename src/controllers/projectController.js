@@ -1,4 +1,5 @@
 const Project = require('../models/Project');
+const Task = require('../models/Task');
 const path = require('path');
 const fs = require('fs');
 
@@ -143,7 +144,7 @@ exports.updateProject = async (req, res) => {
   }
 };
 
-// @desc    Delete project (CEO only)
+// @desc    Delete project (CEO, Super Admin, Project Manager)
 // @route   DELETE /api/projects/:id
 exports.deleteProject = async (req, res) => {
   try {
@@ -151,6 +152,8 @@ exports.deleteProject = async (req, res) => {
     if (!project) {
       return res.status(404).json({ success: false, message: 'Project not found' });
     }
+    // Clean up associated tasks
+    await Task.deleteMany({ project: req.params.id });
     res.json({ success: true, message: 'Project deleted successfully' });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });

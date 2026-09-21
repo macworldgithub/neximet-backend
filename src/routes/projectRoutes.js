@@ -27,7 +27,7 @@ router.route('/')
 router.route('/:id')
   .get(getProjectById)
   .put(authorize('CEO', 'Super Admin', 'Project Manager', 'Team Manager'), updateProject)
-  .delete(authorize('CEO', 'Super Admin'), deleteProject);
+  .delete(authorize('CEO', 'Super Admin', 'Project Manager'), deleteProject);
 
 router.post('/:id/scope', authorize('CEO', 'Super Admin', 'Project Manager', 'Team Manager'), upload.single('scopeFile'), uploadScopeDocument);
 router.delete('/:id/scope/:scopeId', authorize('CEO', 'Super Admin', 'Project Manager', 'Team Manager'), deleteScopeDocument);
