@@ -9,6 +9,7 @@ const {
   uploadScopeDocument,
   deleteScopeDocument,
   addCredential,
+  updateCredential,
   deleteCredential,
   updateResources,
   updateMilestones,
@@ -31,6 +32,7 @@ router.route('/:id')
 router.post('/:id/scope', authorize('CEO', 'Super Admin', 'Project Manager', 'Team Manager'), upload.single('scopeFile'), uploadScopeDocument);
 router.delete('/:id/scope/:scopeId', authorize('CEO', 'Super Admin', 'Project Manager', 'Team Manager'), deleteScopeDocument);
 router.post('/:id/credentials', authorize('CEO', 'Super Admin', 'Project Manager', 'Team Manager'), addCredential);
+router.put('/:id/credentials/:credId', authorize('CEO', 'Super Admin', 'Project Manager', 'Team Manager'), updateCredential);
 router.delete('/:id/credentials/:credId', authorize('CEO', 'Super Admin', 'Project Manager', 'Team Manager'), deleteCredential);
 router.put('/:id/resources', authorize('CEO', 'Super Admin', 'Project Manager', 'Team Manager'), updateResources);
 router.put('/:id/milestones', authorize('CEO', 'Super Admin', 'Project Manager', 'Team Manager'), updateMilestones);

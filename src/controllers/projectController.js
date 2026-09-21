@@ -309,6 +309,39 @@ exports.addCredential = async (req, res) => {
   }
 };
 
+// @desc    Update credential in vault
+// @route   PUT /api/projects/:id/credentials/:credId
+exports.updateCredential = async (req, res) => {
+  try {
+    const project = await Project.findById(req.params.id);
+    if (!project) {
+      return res.status(404).json({ success: false, message: 'Project not found' });
+    }
+
+    const cred = project.credentials.id ? project.credentials.id(req.params.credId) : null;
+    const targetCred = cred || project.credentials.find((c) => c._id.toString() === req.params.credId);
+
+    if (!targetCred) {
+      return res.status(404).json({ success: false, message: 'Credential not found' });
+    }
+
+    const { platform, environment, usernameOrEmail, passwordOrKey, endpointUrl, notes, visibleToRoles } = req.body;
+
+    if (platform !== undefined) targetCred.platform = platform;
+    if (environment !== undefined) targetCred.environment = environment;
+    if (usernameOrEmail !== undefined) targetCred.usernameOrEmail = usernameOrEmail;
+    if (passwordOrKey !== undefined) targetCred.passwordOrKey = passwordOrKey;
+    if (endpointUrl !== undefined) targetCred.endpointUrl = endpointUrl;
+    if (notes !== undefined) targetCred.notes = notes;
+    if (visibleToRoles !== undefined) targetCred.visibleToRoles = visibleToRoles;
+
+    await project.save();
+    res.json({ success: true, credentials: project.credentials, credential: targetCred });
+  } catch (error) {
+    res.status(400).json({ success: false, message: error.message });
+  }
+};
+
 // @desc    Delete credential from vault
 // @route   DELETE /api/projects/:id/credentials/:credId
 exports.deleteCredential = async (req, res) => {
