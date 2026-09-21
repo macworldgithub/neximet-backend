@@ -8,6 +8,7 @@ const generateToken = (id) => {
 };
 
 
+
 // @desc    Auth user & get token
 // @route   POST /api/auth/login
 exports.login = async (req, res) => {
