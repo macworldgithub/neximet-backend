@@ -11,21 +11,25 @@ const getTodayString = (date = new Date()) => {
   return `${year}-${month}-${day}`;
 };
 
-// @desc    Get roll-up dashboard metrics for executive and team overview
+// @desc    Get roll-up dashboard metrics tailored to logged-in user role and department
 // @route   GET /api/dashboard/stats
 exports.getStats = async (req, res) => {
   try {
     const todayStr = getTodayString();
     const currentMonthPrefix = todayStr.substring(0, 7);
 
-    const isExecutive = ['CEO', 'Super Admin'].includes(req.user?.role);
+    const currentUser = req.user;
+    const isExecutive = ['CEO', 'Super Admin'].includes(currentUser?.role);
+    const isManager = ['Project Manager', 'Team Manager'].includes(currentUser?.role);
+    const userDept = currentUser?.department;
 
-    // 1. Projects Statistics (Scoped for non-executives)
-    const projectFilter = (!isExecutive && req.user?.department && req.user.department !== 'Executive')
-      ? { department: req.user.department }
+    // 1. Projects Statistics (Scoped for department if not executive)
+    const projectFilter = (!isExecutive && userDept && userDept !== 'Executive')
+      ? { department: userDept }
       : {};
 
-    const allProjects = await Project.find(projectFilter).select('title code department status completionPercentage deadline clientName priority');
+    const allProjects = await Project.find(projectFilter)
+      .select('title code department status completionPercentage deadline clientName priority');
     const totalProjects = allProjects.length;
     const activeProjects = allProjects.filter((p) => p.status === 'in_progress').length;
     const completedProjects = allProjects.filter((p) => p.status === 'completed').length;
@@ -40,8 +44,8 @@ exports.getStats = async (req, res) => {
       'WordPress Team',
     ];
 
-    const displayDepartments = (!isExecutive && req.user?.department && req.user.department !== 'Executive')
-      ? [req.user.department]
+    const displayDepartments = (!isExecutive && userDept && userDept !== 'Executive')
+      ? [userDept]
       : allDepartments;
 
     const departmentStats = displayDepartments.map((dept) => {
@@ -60,40 +64,101 @@ exports.getStats = async (req, res) => {
       };
     });
 
-    // 2. Users / Employees
-    const totalEmployees = await User.countDocuments({ isActive: true, role: { $ne: 'CEO' } });
+    // 2. Personal Tasks assigned to this user
+    const Task = require('../models/Task');
+    const myTasks = await Task.find({ assignedTo: currentUser._id })
+      .populate('project', 'title code department')
+      .sort({ updatedAt: -1 });
 
-    // 3. Today's Attendance
+    const myTasksCount = myTasks.length;
+    const myActiveTasks = myTasks.filter((t) => t.status === 'in_progress').length;
+    const myReviewTasks = myTasks.filter((t) => t.status === 'review').length;
+    const myDoneTasks = myTasks.filter((t) => t.status === 'done' || t.status === 'completed').length;
+    const myTodoTasks = myTasks.filter((t) => t.status === 'todo' || t.status === 'backlog').length;
+
+    // 3. Attendance & Telemetry Scoping
+    // A. Personal Attendance
+    const myTodayRecord = await Attendance.findOne({ user: currentUser._id, date: todayStr });
+    const myMonthRecords = await Attendance.find({
+      user: currentUser._id,
+      date: { $regex: `^${currentMonthPrefix}` },
+    });
+    const myMonthlyPresentCount = myMonthRecords.filter((r) => ['present', 'late', 'half_day'].includes(r.status)).length;
+    const myMonthlyLateCount = myMonthRecords.filter((r) => r.isLate).length;
+    const myMonthlyDeductionsTotal = myMonthRecords.reduce((sum, r) => sum + (r.deductionAmount || 0), 0);
+
+    // B. Department Attendance & Squad Members
+    const deptUsers = (!isExecutive && userDept && userDept !== 'Executive')
+      ? await User.find({ department: userDept, isActive: true }).select('name email role designation department phone')
+      : [];
+    const deptTotalEmployees = deptUsers.length;
+
+    // C. Company-wide Attendance
+    const totalEmployees = await User.countDocuments({ isActive: true, role: { $ne: 'CEO' } });
     const todayRecords = await Attendance.find({ date: todayStr }).populate('user', 'name role department');
     const presentCount = todayRecords.filter((r) => r.status === 'present').length;
     const lateCount = todayRecords.filter((r) => r.isLate).length;
     const halfDayCount = todayRecords.filter((r) => r.status === 'half_day').length;
-    const checkedInCount = todayRecords.length;
+    const checkedInCount = todayRecords.filter((r) => r.status !== 'absent' && r.checkIn).length;
     const absentCount = Math.max(0, totalEmployees - checkedInCount);
-
     const todayDeductionTotal = todayRecords.reduce((sum, r) => sum + (r.deductionAmount || 0), 0);
 
-    // 4. Monthly Deductions
-    const monthRecords = await Attendance.find({
-      date: { $regex: `^${currentMonthPrefix}` },
-      deductionAmount: { $gt: 0 },
-    });
-    const monthlyDeductionsTotal = monthRecords.reduce((sum, r) => sum + (r.deductionAmount || 0), 0);
+    // Department-scoped today attendance
+    const deptTodayRecords = todayRecords.filter((r) => r.user && r.user.department === userDept);
+    const deptCheckedInCount = deptTodayRecords.filter((r) => r.status !== 'absent' && r.checkIn).length;
+    const deptPresentCount = deptTodayRecords.filter((r) => r.status === 'present').length;
+    const deptLateCount = deptTodayRecords.filter((r) => r.isLate).length;
+    const deptAbsentCount = Math.max(0, deptTotalEmployees - deptCheckedInCount);
 
-    // 5. Critical Upcoming Deadlines
+    // Company monthly deductions (only computed for CEO/Super Admin)
+    let companyMonthlyDeductionsTotal = 0;
+    if (isExecutive) {
+      const monthRecords = await Attendance.find({
+        date: { $regex: `^${currentMonthPrefix}` },
+        deductionAmount: { $gt: 0 },
+      });
+      companyMonthlyDeductionsTotal = monthRecords.reduce((sum, r) => sum + (r.deductionAmount || 0), 0);
+    }
+
+    // 4. Critical Upcoming Deadlines
     const now = new Date();
     const upcomingDeadlines = allProjects
       .filter((p) => p.status !== 'completed' && new Date(p.deadline) >= now)
       .sort((a, b) => new Date(a.deadline) - new Date(b.deadline))
       .slice(0, 5);
 
-    // 6. Pending Leave Approvals (Only visible to CEOs / Super Admins)
+    // 5. Pending Leaves Count
     const pendingLeavesCount = isExecutive
       ? await LeaveRequest.countDocuments({ status: 'pending' })
-      : 0;
+      : await LeaveRequest.countDocuments({ user: currentUser._id, status: 'pending' });
+
+    // 6. Department Squad Members live status
+    const squadMembers = (!isExecutive && userDept && userDept !== 'Executive')
+      ? deptUsers.map((u) => {
+          const rec = deptTodayRecords.find((r) => r.user?._id?.toString() === u._id.toString());
+          return {
+            _id: u._id,
+            name: u.name,
+            email: u.email,
+            role: u.role,
+            designation: u.designation,
+            phone: u.phone,
+            todayStatus: rec ? rec.status : 'not_checked_in',
+            checkIn: rec ? rec.checkIn : null,
+            isLate: rec ? rec.isLate : false,
+          };
+        })
+      : [];
 
     res.json({
       success: true,
+      userScope: {
+        role: currentUser.role,
+        department: currentUser.department,
+        isExecutive,
+        isManager,
+        isMember: !isExecutive && !isManager,
+      },
       projects: {
         total: totalProjects,
         active: activeProjects,
@@ -101,6 +166,22 @@ exports.getStats = async (req, res) => {
         inReview: reviewProjects,
         planning: planningProjects,
         departmentBreakdown: departmentStats,
+      },
+      tasks: {
+        total: myTasksCount,
+        active: myActiveTasks,
+        review: myReviewTasks,
+        done: myDoneTasks,
+        todo: myTodoTasks,
+        myRecentTasks: myTasks.slice(0, 6).map((t) => ({
+          _id: t._id,
+          title: t.title,
+          issueKey: t.issueKey,
+          status: t.status,
+          priority: t.priority,
+          deadline: t.deadline,
+          project: t.project,
+        })),
       },
       attendance: {
         totalEmployees,
@@ -110,10 +191,31 @@ exports.getStats = async (req, res) => {
         halfDayCount,
         absentCount,
         todayDeductions: todayDeductionTotal,
-        monthlyDeductions: monthlyDeductionsTotal,
+        monthlyDeductions: companyMonthlyDeductionsTotal,
+
+        // Department telemetry
+        deptTotalEmployees,
+        deptCheckedInToday: deptCheckedInCount,
+        deptPresentCount,
+        deptLateCount,
+        deptAbsentCount,
+
+        // Personal telemetry
+        myTodayStatus: myTodayRecord ? {
+          status: myTodayRecord.status,
+          checkIn: myTodayRecord.checkIn,
+          isLate: myTodayRecord.isLate,
+          minutesLate: myTodayRecord.minutesLate,
+          deductionAmount: myTodayRecord.deductionAmount,
+          deductionReason: myTodayRecord.deductionReason,
+        } : null,
+        myMonthlyPresentCount,
+        myMonthlyLateCount,
+        myMonthlyDeductions: myMonthlyDeductionsTotal,
       },
       upcomingDeadlines,
       pendingLeavesCount,
+      squadMembers,
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });

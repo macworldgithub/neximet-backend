@@ -429,3 +429,75 @@ exports.adminResetPassword = async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 };
+
+// @desc    Update self profile (phone and password)
+// @route   PUT /api/auth/profile
+exports.updateProfile = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id).select('+password');
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User account not found.' });
+    }
+
+    const { phone, currentPassword, newPassword } = req.body;
+
+    if (phone !== undefined) {
+      user.phone = phone.trim();
+    }
+
+    if (newPassword) {
+      if (newPassword.length < 6) {
+        return res.status(400).json({
+          success: false,
+          message: 'New password must be at least 6 characters long.',
+        });
+      }
+
+      if (currentPassword) {
+        const isMatch = await user.matchPassword(currentPassword);
+        if (!isMatch) {
+          return res.status(400).json({
+            success: false,
+            message: 'Current password is incorrect.',
+          });
+        }
+      }
+
+      user.password = newPassword;
+
+      if (user.passwordResetRequest && user.passwordResetRequest.status === 'Pending') {
+        user.passwordResetRequest = {
+          status: 'Completed',
+          resolvedAt: new Date(),
+          resolvedBy: user._id,
+        };
+      }
+    }
+
+    await user.save();
+
+    const updatedUser = await User.findById(user._id)
+      .select('-password')
+      .populate('reportsTo', 'name email role designation');
+
+    res.json({
+      success: true,
+      message: 'Profile updated successfully.',
+      user: {
+        id: updatedUser._id,
+        name: updatedUser.name,
+        email: updatedUser.email,
+        role: updatedUser.role,
+        department: updatedUser.department,
+        designation: updatedUser.designation,
+        baseSalary: updatedUser.baseSalary,
+        dailyWage: updatedUser.dailyWage,
+        leaveBalances: updatedUser.leaveBalances,
+        phone: updatedUser.phone,
+        joinDate: updatedUser.joinDate,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};

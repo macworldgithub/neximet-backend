@@ -436,7 +436,7 @@ exports.getDailyRoster = async (req, res) => {
       return {
         user: u,
         date: dateStr,
-        checkedIn: !!(rec && rec.checkIn),
+        checkedIn: !!(rec && rec.checkIn && rec.status !== 'absent'),
         checkIn: rec ? rec.checkIn : null,
         checkOut: rec ? rec.checkOut : null,
         status: rec ? rec.status : 'not_checked_in',
@@ -452,6 +452,102 @@ exports.getDailyRoster = async (req, res) => {
     });
 
     res.json({ success: true, date: dateStr, roster });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    CEO / Admin Mark Employee Absent (revert/override attendance to absent)
+// @route   POST /api/attendance/mark-absent
+exports.markAbsent = async (req, res) => {
+  try {
+    const { userId, date, notes } = req.body;
+    if (!userId) {
+      return res.status(400).json({ success: false, message: 'Employee User ID is required.' });
+    }
+
+    const targetDate = date || getTodayString();
+    const targetUser = await User.findById(userId);
+    if (!targetUser) {
+      return res.status(404).json({ success: false, message: 'Employee not found.' });
+    }
+
+    const dailyWage = targetUser.dailyWage || (targetUser.baseSalary ? Math.round(targetUser.baseSalary / 30) : 4000);
+
+    let record = await Attendance.findOne({ user: userId, date: targetDate });
+    if (!record) {
+      record = new Attendance({
+        user: userId,
+        date: targetDate,
+      });
+    }
+
+    record.status = 'absent';
+    record.checkIn = null;
+    record.checkOut = null;
+    record.isLate = false;
+    record.minutesLate = 0;
+    record.deductionAmount = dailyWage;
+    record.deductionPercentage = 100;
+    record.deductionReason = notes || 'Marked absent by CEO executive override';
+    record.notes = notes || 'Marked absent by CEO';
+    record.photo = '';
+    if (record.location) {
+      record.location.isVerified = false;
+    }
+
+    await record.save();
+
+    res.json({
+      success: true,
+      message: `${targetUser.name} has been marked absent for ${targetDate}. Daily wage deduction of PKR ${dailyWage.toLocaleString()} applied.`,
+      attendance: record,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    CEO / Admin Mark Employee Present (revert absence back to present)
+// @route   POST /api/attendance/mark-present
+exports.markPresent = async (req, res) => {
+  try {
+    const { userId, date, notes } = req.body;
+    if (!userId) {
+      return res.status(400).json({ success: false, message: 'Employee User ID is required.' });
+    }
+
+    const targetDate = date || getTodayString();
+    const targetUser = await User.findById(userId);
+    if (!targetUser) {
+      return res.status(404).json({ success: false, message: 'Employee not found.' });
+    }
+
+    let record = await Attendance.findOne({ user: userId, date: targetDate });
+    if (!record) {
+      record = new Attendance({
+        user: userId,
+        date: targetDate,
+      });
+    }
+
+    const now = new Date();
+    record.status = 'present';
+    record.checkIn = record.checkIn || now;
+    record.isLate = false;
+    record.minutesLate = 0;
+    record.deductionAmount = 0;
+    record.deductionPercentage = 0;
+    record.deductionReason = notes || 'Marked present by CEO executive override';
+    record.notes = notes || 'Marked present by CEO';
+
+    await record.save();
+
+    res.json({
+      success: true,
+      message: `${targetUser.name} has been marked present for ${targetDate}.`,
+      attendance: record,
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

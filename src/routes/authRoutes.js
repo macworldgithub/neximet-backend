@@ -10,6 +10,7 @@ const {
   getPasswordResetRequests,
   adminResetPassword,
   updateUser,
+  updateProfile,
 } = require('../controllers/authController');
 const { protect } = require('../middleware/auth');
 const { authorize } = require('../middleware/rbac');
@@ -21,6 +22,7 @@ router.post('/ceo-reset-password', resetCeoPassword);
 
 // Authenticated user routes
 router.get('/me', protect, getMe);
+router.put('/profile', protect, updateProfile);
 router.get('/users', protect, getAllUsers);
 
 // Super Admin / CEO protected routes
