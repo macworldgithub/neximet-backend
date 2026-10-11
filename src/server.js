@@ -153,7 +153,8 @@ app.use((err, req, res, next) => {
 // Only listen on port when executed directly as main process (not as a serverless import)
 if (require.main === module && !process.env.VERCEL) {
   const PORT = process.env.PORT || 4000;
-  app.listen(PORT, () => {
+  const { createRealtimeServer } = require('./services/realtime');
+  createRealtimeServer(app).server.listen(PORT, () => {
     console.log(`Neximet Portal Server running on http://localhost:${PORT}`);
   });
 }

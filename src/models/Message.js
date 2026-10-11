@@ -7,6 +7,7 @@ const schema = new mongoose.Schema({
   clientId: { type: String, required: true, maxlength: 100 },
   text: { type: String, trim: true, maxlength: 4000, default: '' },
   readBy: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  deliveredBy: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   attachment: {
     name: String,
     size: Number,

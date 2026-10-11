@@ -1,6 +1,7 @@
 const Conversation = require('../models/Conversation');
 const Message = require('../models/Message');
 const User = require('../models/User');
+const { publish } = require('../services/chatEvents');
 
 const publicUser = '_id name department role isActive';
 const validId = (id) => typeof id === 'string' && /^[a-f\d]{24}$/i.test(id);
@@ -72,7 +73,18 @@ exports.createConversation = wrap(async (req, res) => {
     }
   } else conversation = await Conversation.create(data);
   await populateConversation(conversation);
+  await publish(conversation, 'chat:conversation', { conversationId: String(conversation._id) });
   res.status(201).json({ success: true, conversation });
+});
+
+exports.getConversation = wrap(async (req, res) => {
+  res.json({ success: true, conversation: await populateConversation(await membership(req)) });
+});
+
+exports.getDeliveries = wrap(async (req, res) => {
+  const ids = await Conversation.find({ 'members.user': req.user._id }).distinct('_id');
+  const messages = await Message.find({ conversation: { $in: ids }, sender: { $ne: req.user._id }, deliveredBy: { $ne: req.user._id } }).sort({ _id: 1 }).limit(100).populate('sender', publicUser).lean();
+  res.json({ success: true, messages: messages.map(serializeMessage) });
 });
 
 exports.getMessages = wrap(async (req, res) => {
@@ -102,7 +114,7 @@ exports.sendMessage = wrap(async (req, res) => {
     const sequence = await Conversation.findByIdAndUpdate(conversation._id, { $inc: { nextSequence: 1 } }, { new: true });
     const attachment = req.file ? { name: req.file.originalname.replace(/[\r\n\x00]/g, '').slice(0, 200), size: req.file.size, mimeType: req.file.mimetype, data: req.file.buffer } : undefined;
     try {
-      message = await Message.create({ ...key, sequence: sequence.nextSequence, text: text.trim(), attachment, readBy: [req.user._id] });
+      message = await Message.create({ ...key, sequence: sequence.nextSequence, text: text.trim(), attachment, readBy: [req.user._id], deliveredBy: [req.user._id] });
     } catch (error) {
       if (error.code !== 11000) throw error;
       message = await Message.findOne(key);
@@ -112,22 +124,32 @@ exports.sendMessage = wrap(async (req, res) => {
   // Repair activity metadata on retries too, after the durable message write.
   await Conversation.updateOne({ _id: conversation._id, 'members.user': req.user._id }, { $max: { lastActivityAt: message.createdAt }, $set: { 'members.$.typingUntil': null } });
   await message.populate('sender', publicUser);
+  await publish(conversation, 'chat:message', { conversationId: String(conversation._id), message: serializeMessage(message) });
+  await publish(conversation, 'chat:typing', { conversationId: String(conversation._id), userId: String(req.user._id), typingUntil: null });
+  // Persist the notification outbox before acknowledging. Vercel waitUntil
+  // retains delivery work after the response without delaying the sent tick.
+  await require('../services/chatPush').notifyMessage(conversation, message).catch((error) => console.warn('Chat push deferred:', error.message));
   res.status(201).json({ success: true, message: serializeMessage(message) });
 });
 
-exports.markRead = wrap(async (req, res) => {
-  await membership(req);
+async function receipt(req, res, read) {
+  const conversation = await membership(req);
   const { messageIds } = req.body;
   if (!Array.isArray(messageIds) || !messageIds.length || messageIds.length > 100 || messageIds.some((id) => !validId(id))) throw fail(400, 'Invalid read position');
-  // Mark only messages actually loaded by this reader, including out-of-order writes.
-  await Message.updateMany({ conversation: req.params.id, _id: { $in: messageIds } }, { $addToSet: { readBy: req.user._id } });
+  const ids = await Message.find({ conversation: conversation._id, _id: { $in: messageIds } }).distinct('_id');
+  await Message.updateMany({ _id: { $in: ids } }, { $addToSet: { deliveredBy: req.user._id, ...(read ? { readBy: req.user._id } : {}) } });
+  if (ids.length) await publish(conversation, 'chat:receipt', { conversationId: String(conversation._id), messageIds: ids.map(String), userId: String(req.user._id), status: read ? 'read' : 'delivered' });
   res.json({ success: true });
-});
+}
+exports.markRead = wrap((req, res) => receipt(req, res, true));
+exports.markDelivered = wrap((req, res) => receipt(req, res, false));
 
 exports.setTyping = wrap(async (req, res) => {
-  await membership(req);
+  const conversation = await membership(req);
   if (typeof req.body.typing !== 'boolean') throw fail(400, 'Invalid typing state');
-  await Conversation.updateOne({ _id: req.params.id, 'members.user': req.user._id }, { $set: { 'members.$.typingUntil': req.body.typing ? new Date(Date.now() + 6000) : null } });
+  const typingUntil = req.body.typing ? new Date(Date.now() + 6000) : null;
+  await Conversation.updateOne({ _id: req.params.id, 'members.user': req.user._id }, { $set: { 'members.$.typingUntil': typingUntil } });
+  await publish(conversation, 'chat:typing', { conversationId: String(conversation._id), userId: String(req.user._id), typingUntil });
   res.json({ success: true });
 });
 

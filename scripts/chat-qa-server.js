@@ -14,9 +14,10 @@ const Conversation = require('../src/models/Conversation');
 const Message = require('../src/models/Message');
 const { protect } = require('../src/middleware/auth');
 process.env.JWT_SECRET = 'temporary-chat-qa-secret';
-let mongo, directory, server;
+let mongo, directory, server, realtime;
 async function cleanup() {
-  if (server) await new Promise((resolve) => server.close(resolve));
+  if (realtime) await new Promise((resolve) => realtime.io.close(resolve));
+  else if (server) await new Promise((resolve) => server.close(resolve));
   await mongoose.disconnect();
   if (mongo && mongo.exitCode === null) {
     const stopped = new Promise((resolve) => mongo.once('exit', resolve)); mongo.kill(); await stopped;
@@ -55,7 +56,8 @@ async function main() {
   app.get('/api/leaves/summary', (req, res) => res.json({ success: true, totalHolidaysLeft: 32 }));
   app.use('/api/chat', require('../src/routes/chatRoutes'));
   app.use((error, req, res, next) => res.status(error.status || 500).json({ success: false, message: error.message }));
-  server = app.listen(4011, '127.0.0.1', () => console.log('Temporary chat QA API on http://127.0.0.1:4011. Sign in with chat-qa-0@example.test / chat-qa-only.'));
+  realtime = require('../src/services/realtime').createRealtimeServer(app, { pollInterval: 100 });
+  server = realtime.server.listen(4011, '127.0.0.1', () => console.log('Temporary chat QA API on http://127.0.0.1:4011. Sign in with chat-qa-0@example.test / chat-qa-only.'));
   process.on('SIGINT', () => void cleanup().then(() => process.exit()));
   process.on('SIGTERM', () => void cleanup().then(() => process.exit()));
 }

@@ -1,3 +1,4 @@
-// Serverless function entrypoint for Vercel
+// Vercel WebSocket beta accepts a Node HTTP server with upgrade handlers.
 const app = require('../src/server');
-module.exports = app;
+const { createRealtimeServer } = require('../src/services/realtime');
+module.exports = createRealtimeServer(app).server;
