@@ -31,7 +31,11 @@ const connectDB = async () => {
   if (!cached.promise) {
     const mongoUri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/neximet_portal';
     const opts = {
-      bufferCommands: false,
+      // Models register while the initial connection is still opening. Buffering
+      // lets Mongoose wait for the driver database before creating collections
+      // and indexes; request middleware still awaits connectDB() before queries.
+      bufferCommands: true,
+      bufferTimeoutMS: 10000,
       serverSelectionTimeoutMS: 8000,
       connectTimeoutMS: 10000,
       maxPoolSize: 10,

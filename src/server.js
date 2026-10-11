@@ -7,7 +7,9 @@ const fs = require('fs');
 const connectDB = require('./config/db');
 
 // Connect Database
-connectDB();
+connectDB().catch(() => {
+  // connectDB logs the failure; request middleware retries transient startup errors.
+});
 
 const app = express();
 
