@@ -132,6 +132,7 @@ app.use('/api/attendance', require('./routes/attendanceRoutes'));
 app.use('/api/deductions', require('./routes/deductionRoutes'));
 app.use('/api/leaves', require('./routes/leaveRoutes'));
 app.use('/api/dashboard', require('./routes/dashboardRoutes'));
+app.use('/api/chat', require('./routes/chatRoutes'));
 
 // Health check
 app.get('/api/health', (req, res) => {

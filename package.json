@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
+    "test:chat": "node --test test/chat.test.js",
     "seed": "node src/seed/seedRealUsers.js",
     "seed:legacy": "node src/seed/seedData.js"
   },
