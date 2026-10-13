@@ -1,554 +1,176 @@
+const mongoose = require('mongoose');
 const Attendance = require('../models/Attendance');
-const DeductionRule = require('../models/DeductionRule');
 const User = require('../models/User');
+const { TIME_ZONE, fail, companyDate, validDate, validMonth, shiftDate, scheduledEnd, dailyWage, calculateAttendance, distanceMeters, validateSelfie } = require('../services/attendancePolicy');
+const { activeRule, closeEndedShifts, dayExemptions, dailyRoster } = require('../services/attendanceRecords');
 
-const getTodayString = (date = new Date()) => {
-  const d = new Date(date);
-  const year = d.getFullYear();
-  const month = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${year}-${month}-${day}`;
+const executive = user => ['CEO', 'Super Admin'].includes(user.role);
+const wrap = handler => async (req, res) => {
+  try { await handler(req, res); }
+  catch (error) {
+    if (error.code === 11000) return res.status(409).json({ success: false, message: error.keyPattern?.deviceLockKey ? 'This browser device has already been used by another employee for this attendance day.' : 'Attendance was already recorded or changed. Refresh and try again.' });
+    res.status(error.status || (error.name === 'ValidationError' || error.name === 'CastError' ? 400 : 500)).json({ success: false, message: error.message });
+  }
 };
+const id = value => { if (!mongoose.isValidObjectId(value)) fail('Invalid employee or attendance ID.'); return value; };
+const text = (value, max = 1000) => { if (value === undefined || value === null) return ''; if (typeof value !== 'string' || value.length > max) fail('Text exceeds the allowed length.'); return value.trim(); };
 
-// Helper: Calculate Haversine distance in meters between two GPS coordinates
-const calculateDistanceMeters = (lat1, lon1, lat2, lon2) => {
-  const R = 6371e3; // Earth's radius in meters
-  const phi1 = (lat1 * Math.PI) / 180;
-  const phi2 = (lat2 * Math.PI) / 180;
-  const deltaPhi = ((lat2 - lat1) * Math.PI) / 180;
-  const deltaLambda = ((lon2 - lon1) * Math.PI) / 180;
-
-  const a =
-    Math.sin(deltaPhi / 2) * Math.sin(deltaPhi / 2) +
-    Math.cos(phi1) * Math.cos(phi2) * Math.sin(deltaLambda / 2) * Math.sin(deltaLambda / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-
-  return Math.round(R * c);
-};
-
-// Helper: Calculate late minutes and deduction
-const calculateLateAndDeductions = async (checkInDate, user, customRule = null) => {
-  const rule = customRule || (await DeductionRule.findOne({ isActive: true })) || {
-    shiftStartTime: '09:00',
-    gracePeriodMinutes: 15,
-    lateThresholdMinutes: 30,
-    deductionType: 'percentage',
-    percentageDeductionRate: 5,
-    fixedDeductionAmount: 1000,
-    halfDayThresholdMinutes: 60,
-    consecutiveLateThreshold: 3,
-    consecutivePenaltyMultiplier: 1.5,
+exports.checkIn = wrap(async (req, res) => {
+  const user = await User.findById(req.user.id);
+  if (!user?.isActive) fail('Employee is inactive or unavailable.', 403);
+  const body = req.body, now = new Date(), rule = await activeRule();
+  const simulated = body.customTime !== undefined || body.bypassGeofence !== undefined || body.simulated === true;
+  if (simulated && user.role !== 'CEO') fail('Attendance simulation is available only to the CEO.', 403);
+  let checkIn = now;
+  if (body.customTime !== undefined) {
+    if (typeof body.customTime !== 'string' || !/^\d{4}-\d{2}-\d{2}T.*(Z|[+-]\d{2}:\d{2})$/.test(body.customTime)) fail('Simulation timestamp must include a timezone.');
+    checkIn = new Date(body.customTime);
+    if (!Number.isFinite(checkIn.getTime()) || shiftDate(checkIn, rule) !== shiftDate(now, rule)) fail('Simulation is restricted to the current attendance day.');
+  }
+  if (body.bypassGeofence !== undefined && typeof body.bypassGeofence !== 'boolean') fail('Invalid geofence simulation flag.');
+  const date = shiftDate(checkIn, rule);
+  await closeEndedShifts(rule, { user: user._id }, now);
+  const existing = await Attendance.findOne({ user: user._id, date });
+  if (existing?.override?.type === 'absent' || (existing?.status === 'absent' && !existing?.checkIn)) fail('An administrator marked this day absent. Contact an administrator to restore it.', 409);
+  if (existing?.checkIn) fail('Already checked in for this attendance day.', 409);
+  const open = await Attendance.findOne({ user: user._id, checkIn: { $ne: null }, checkOut: null, date: { $ne: date }, 'override.type': { $ne: 'absent' } });
+  if (open) fail('Close the previous open shift before checking in again.', 409);
+  const deviceId = text(body.deviceId, 160);
+  if (rule.antiProxySettings.enforceSingleDevicePerDay) {
+    if (!deviceId) fail('Device identification is required. Reload the application and try again.');
+    const conflict = await Attendance.exists({ date, 'deviceInfo.deviceId': deviceId, user: { $ne: user._id } });
+    if (conflict) fail('This browser device has already been used by another employee for this attendance day.', 403);
+  }
+  const photo = body.photo ? validateSelfie(body.photo) : '';
+  if (rule.antiProxySettings.requireSelfieVerification && !photo) fail('Capture a selfie before checking in.');
+  const office = rule.officeLocation;
+  const hasCoordinates = body.latitude !== undefined && body.longitude !== undefined;
+  const location = { latitude: null, longitude: null, distanceMeters: null, isVerified: false, officeAddress: office.officeAddress };
+  if (hasCoordinates) {
+    if (typeof body.latitude !== 'number' || !Number.isFinite(body.latitude) || Math.abs(body.latitude) > 90 || typeof body.longitude !== 'number' || !Number.isFinite(body.longitude) || Math.abs(body.longitude) > 180) fail('GPS coordinates are invalid.');
+    location.latitude = body.latitude; location.longitude = body.longitude;
+    location.distanceMeters = distanceMeters(body.latitude, body.longitude, office.latitude, office.longitude);
+  }
+  if (office.enforceLocation && !body.bypassGeofence) {
+    if (!hasCoordinates) fail('Allow location access to check in from the office.');
+    if (location.distanceMeters > office.radiusMeters) fail('Check-in rejected: you are ' + location.distanceMeters + 'm from the office; the allowed radius is ' + office.radiusMeters + 'm.', 403);
+    location.isVerified = !simulated;
+  }
+  const priorLateCount = await Attendance.countDocuments({ user: user._id, date: { $gte: date.slice(0, 7) + '-01', $lt: date }, isLate: true });
+  let calculation = calculateAttendance(checkIn, user, rule, priorLateCount);
+  const exemptions = await dayExemptions(date, [user._id]);
+  if (exemptions.leaveUsers.has(String(user._id)) || exemptions.holiday) calculation = { status: 'present', isLate: false, minutesLate: 0, deductionAmount: 0, deductionPercentage: 0, deductionReason: exemptions.holiday ? 'Attendance recorded on a company holiday; no late penalty.' : 'Attendance recorded during approved full-day leave; no late penalty.' };
+  if (existing?.override?.type === 'present') calculation = { ...calculation, status: 'present', isLate: false, minutesLate: 0, deductionAmount: 0, deductionPercentage: 0, deductionReason: existing.deductionReason };
+  await Attendance.init();
+  const fields = {
+    checkIn, scheduledCheckOut: scheduledEnd(date, rule), ...calculation, location, photo,
+    deviceInfo: { deviceId, deviceType: text(body.deviceType, 100), browser: text(body.browser, 100), userAgent: text(req.headers['user-agent'], 500) },
+    notes: text(body.notes), ipAddress: req.ip || '', isSimulated: simulated,
+    ...(rule.antiProxySettings.enforceSingleDevicePerDay ? { deviceLockKey: date + ':' + deviceId } : {}),
   };
+  const record = existing
+    ? await Attendance.findOneAndUpdate({ _id: existing._id, __v: existing.__v === undefined ? { $exists: false } : existing.__v, checkIn: null, 'override.type': { $ne: 'absent' } }, { $set: fields, $inc: { __v: 1 } }, { new: true, runValidators: true })
+    : await Attendance.create({ user: user._id, date, ...fields });
+  if (!record) fail('Attendance changed while checking in. Refresh and try again.', 409);
+  await closeEndedShifts(rule, { user: user._id }, now);
+  const saved = await Attendance.findById(record._id).select('-auditTrail -override.snapshot');
+  res.status(201).json({ success: true, message: (simulated ? 'CEO simulation recorded. ' : 'Check-in recorded. ') + (calculation.isLate ? calculation.minutesLate + ' minutes late.' : 'On time.'), attendance: saved, distanceFromOffice: location.distanceMeters });
+});
 
-  const [shiftHour, shiftMinute] = (rule.shiftStartTime || '09:00').split(':').map(Number);
-  const shiftStartDate = new Date(checkInDate);
-  shiftStartDate.setHours(shiftHour, shiftMinute, 0, 0);
+exports.checkOut = wrap(async (req, res) => {
+  const now = new Date(), rule = await activeRule();
+  let record = await Attendance.findOne({ user: req.user.id, checkIn: { $ne: null }, checkOut: null, 'override.type': { $ne: 'absent' } }).sort({ checkIn: -1 });
+  if (!record) fail('No open check-in found. This shift may already be closed.', 409);
+  if (new Date(record.checkIn) > now) fail('Cannot check out before the recorded check-in time.');
+  const scheduled = record.scheduledCheckOut || scheduledEnd(record.date, rule);
+  const end = new Date(Math.min(now.getTime(), Math.max(new Date(scheduled).getTime(), new Date(record.checkIn).getTime())));
+  record = await Attendance.findOneAndUpdate({ _id: record._id, checkOut: null, 'override.type': { $ne: 'absent' } }, { $set: { checkOut: end, checkOutSource: end < now ? 'shift_end' : 'employee', totalWorkHours: Number(((end - new Date(record.checkIn)) / 3600000).toFixed(2)) }, $inc: { __v: 1 } }, { new: true, runValidators: true }).select('-auditTrail -override.snapshot');
+  if (!record) fail('Attendance changed while checking out. Refresh the page.', 409);
+  res.json({ success: true, message: 'Shift closed. Total hours: ' + record.totalWorkHours + 'h.', attendance: record });
+});
 
-  const diffMs = checkInDate.getTime() - shiftStartDate.getTime();
-  const diffMinutes = Math.floor(diffMs / (1000 * 60));
+exports.getTodayStatus = wrap(async (req, res) => {
+  const now = new Date(), rule = await activeRule(), date = shiftDate(now, rule);
+  await closeEndedShifts(rule, { user: req.user.id }, now);
+  const [record, user, exemptions] = await Promise.all([
+    Attendance.findOne({ user: req.user.id, date }).select('-auditTrail -override.snapshot'), User.findById(req.user.id), dayExemptions(date, [req.user.id]),
+  ]);
+  const attendance = record || (exemptions.leaveUsers.has(String(req.user.id)) ? { date, status: 'on_leave' } : exemptions.holiday ? { date, status: 'on_holiday' } : null);
+  res.json({ success: true, date, timeZone: TIME_ZONE, attendance, officeLocation: rule.officeLocation, antiProxySettings: rule.antiProxySettings,
+    shiftStartTime: rule.shiftStartTime, shiftEndTime: rule.shiftEndTime, gracePeriodMinutes: rule.gracePeriodMinutes,
+    halfDayThresholdMinutes: rule.halfDayThresholdMinutes, fullDayAbsentThresholdMinutes: rule.fullDayAbsentThresholdMinutes,
+    leaveBalances: user?.leaveBalances || { casual: 0, sick: 0, annual: 0 }, dailyWage: dailyWage(user || {}) });
+});
 
-  let isLate = false;
-  let minutesLate = 0;
-  let status = 'present';
-  let deductionAmount = 0;
-  let deductionPercentage = 0;
-  let deductionReason = '';
+exports.getHistory = wrap(async (req, res) => {
+  const { userId, month, department, status } = req.query, filter = {};
+  if (!executive(req.user)) filter.user = req.user.id;
+  else if (userId && userId !== 'all') filter.user = id(userId);
+  if (month) { if (!validMonth(month)) fail('Month must be a valid YYYY-MM.'); filter.date = { $regex: '^' + month }; }
+  if (status && status !== 'All') { if (!['present','late','half_day','absent','on_leave'].includes(status)) fail('Invalid attendance status.'); filter.status = status; }
+  if (department && department !== 'All') {
+    const matching = await User.find({ department, ...(filter.user ? { _id: filter.user } : {}) }).select('_id');
+    filter.user = { $in: matching.map(user => user._id) };
+  }
+  const page = Number(req.query.page || 1), limit = Number(req.query.limit || 20);
+  if (!Number.isInteger(page) || page < 1 || !Number.isInteger(limit) || limit < 1 || limit > 100) fail('Invalid pagination (limit 1–100).');
+  await closeEndedShifts(await activeRule(), filter.user ? { user: filter.user } : {});
+  const aggregateFilter = { ...filter };
+  if (filter.user) aggregateFilter.user = filter.user.$in ? { $in: filter.user.$in.map(value => new mongoose.Types.ObjectId(String(value))) } : new mongoose.Types.ObjectId(String(filter.user));
+  const [records, summary] = await Promise.all([
+    Attendance.find(filter).select('-photo -auditTrail -override.snapshot').populate('user', 'name email department designation dailyWage').sort({ date: -1, _id: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+    Attendance.aggregate([{ $match: aggregateFilter }, { $group: { _id: null, count: { $sum: 1 }, lateCount: { $sum: { $cond: ['$isLate', 1, 0] } }, totalDeductions: { $sum: '$deductionAmount' } } }]),
+  ]);
+  const photoIds = new Set((await Attendance.find({ _id: { $in: records.map(record => record._id) }, photo: { $exists: true, $nin: ['', null] } }).select('_id')).map(record => String(record._id)));
+  const totals = summary[0] || { count: 0, lateCount: 0, totalDeductions: 0 };
+  res.json({ success: true, count: totals.count, lateCount: totals.lateCount, totalDeductions: totals.totalDeductions, page, limit,
+    pages: Math.ceil(totals.count / limit), records: records.map(record => ({ ...record, hasPhoto: photoIds.has(String(record._id)) })) });
+});
 
-  const dailyWage = user.dailyWage || (user.baseSalary ? Math.round(user.baseSalary / 30) : 4000);
+exports.getDailyRoster = wrap(async (req, res) => {
+  const rule = await activeRule();
+  const date = req.query.date || shiftDate(new Date(), rule);
+  if (!validDate(date)) fail('Date must be a valid YYYY-MM-DD.');
+  await closeEndedShifts(rule);
+  res.json({ success: true, date, timeZone: TIME_ZONE, roster: await dailyRoster(date) });
+});
 
-  if (diffMinutes <= 0) {
-    // On-time or early
-    status = 'present';
-    isLate = false;
-    minutesLate = 0;
-  } else if (diffMinutes <= rule.gracePeriodMinutes) {
-    // Within grace period
-    status = 'present';
-    isLate = false;
-    minutesLate = diffMinutes;
-    deductionReason = `Arrival within ${rule.gracePeriodMinutes} mins grace window (${diffMinutes}m). No deduction applied.`;
+exports.getPhoto = wrap(async (req, res) => {
+  const record = await Attendance.findById(id(req.params.id)).select('user photo date checkIn deviceInfo location isSimulated');
+  if (!record || (!executive(req.user) && String(record.user) !== String(req.user.id))) fail('Attendance photo unavailable.', 404);
+  res.set('Cache-Control', 'private, no-store');
+  res.json({ success: true, attendance: record });
+});
+
+async function overrideAttendance(req, res, absent) {
+  if (!executive(req.user)) fail('Administrator access required.', 403);
+  const rule = await activeRule();
+  const userId = id(req.body.userId), date = req.body.date || shiftDate(new Date(), rule);
+  if (!validDate(date) || date > companyDate()) fail('Attendance override requires a valid date that is not in the future.');
+  const targetUser = await User.findById(userId);
+  if (!targetUser?.isActive) fail('Employee not found or inactive.', 404);
+  await Attendance.init();
+  const record = await Attendance.findOne({ user: userId, date });
+  const previousStatus = record?.status || 'not_checked_in';
+  const previousState = record ? Object.fromEntries(['status','isLate','minutesLate','deductionAmount','deductionPercentage','deductionReason','notes'].map(key => [key, record[key]])) : null;
+  const reason = text(req.body.notes) || (absent ? 'Administrator marked absent.' : 'Administrator restored attendance.');
+  let fields;
+  if (absent) {
+    const snapshot = record?.override?.type === 'absent' ? record.override.snapshot : Object.fromEntries(['status','isLate','minutesLate','deductionAmount','deductionPercentage','deductionReason','notes','override'].map(key => [key, record ? record[key] : undefined]));
+    fields = { status: 'absent', isLate: false, minutesLate: 0, deductionAmount: dailyWage(targetUser), deductionPercentage: 100, deductionReason: reason, notes: reason,
+      override: { type: 'absent', snapshot, by: req.user.id, at: new Date() } };
   } else {
-    // Late arrival
-    isLate = true;
-    minutesLate = diffMinutes;
-
-    if (diffMinutes >= rule.halfDayThresholdMinutes) {
-      status = 'half_day';
-      deductionPercentage = 50;
-      deductionAmount = Math.round(dailyWage * 0.5);
-      deductionReason = `Late by ${diffMinutes} mins (exceeded ${rule.halfDayThresholdMinutes}m threshold -> Half-Day 50% wage deduction)`;
-    } else {
-      status = 'late';
-      if (rule.deductionType === 'percentage') {
-        deductionPercentage = rule.percentageDeductionRate;
-        deductionAmount = Math.round((dailyWage * rule.percentageDeductionRate) / 100);
-        deductionReason = `Late by ${diffMinutes} mins (exceeded ${rule.gracePeriodMinutes}m grace -> ${rule.percentageDeductionRate}% daily wage deduction)`;
-      } else {
-        deductionAmount = rule.fixedDeductionAmount;
-        deductionPercentage = Math.round((rule.fixedDeductionAmount / dailyWage) * 100);
-        deductionReason = `Late by ${diffMinutes} mins (exceeded ${rule.gracePeriodMinutes}m grace -> Fixed deduction of PKR ${rule.fixedDeductionAmount})`;
-      }
-    }
-
-    // Check consecutive late count in current month for this user
-    const currentMonthPrefix = getTodayString(checkInDate).substring(0, 7); // YYYY-MM
-    const lateCountThisMonth = await Attendance.countDocuments({
-      user: user._id,
-      date: { $regex: `^${currentMonthPrefix}` },
-      isLate: true,
-    });
-
-    if (lateCountThisMonth >= (rule.consecutiveLateThreshold || 3)) {
-      const multiplier = rule.consecutivePenaltyMultiplier || 1.5;
-      deductionAmount = Math.round(deductionAmount * multiplier);
-      deductionPercentage = Math.round(deductionPercentage * multiplier);
-      deductionReason += ` [Warning: ${lateCountThisMonth + 1}th late arrival this month. Applied ${multiplier}x repeat penalty]`;
-    }
+    const snapshot = record?.override?.type === 'absent' ? record.override.snapshot : null;
+    fields = snapshot?.status ? { ...snapshot, override: snapshot.override || null } : { status: 'present', isLate: false, minutesLate: 0, deductionAmount: 0, deductionPercentage: 0, deductionReason: reason, notes: reason, override: { type: 'present', by: req.user.id, at: new Date() } };
   }
-
-  return {
-    isLate,
-    minutesLate,
-    status,
-    deductionAmount,
-    deductionPercentage,
-    deductionReason,
-  };
-};
-
-// @desc    Mark Check-In
-exports.checkIn = async (req, res) => {
-  try {
-    const user = await User.findById(req.user.id);
-    const { customTime, notes, latitude, longitude, bypassGeofence, deviceId, deviceType, browser, photo } = req.body;
-
-    const checkInDate = customTime ? new Date(customTime) : new Date();
-    const todayStr = getTodayString(checkInDate);
-
-    // 1. Check if already checked in today
-    let record = await Attendance.findOne({ user: user._id, date: todayStr });
-    if (record && record.checkIn) {
-      return res.status(400).json({
-        success: false,
-        message: `Already checked in today at ${new Date(record.checkIn).toLocaleTimeString()}`,
-        attendance: record,
-      });
-    }
-
-    // 2. Fetch active policy, office location rules, and anti-proxy settings
-    const rule = (await DeductionRule.findOne({ isActive: true })) || {
-      shiftStartTime: '09:00',
-      gracePeriodMinutes: 15,
-      lateThresholdMinutes: 30,
-      officeLocation: {
-        officeAddress: 'Neximet Head Office, Karachi',
-        latitude: 24.8607,
-        longitude: 67.0011,
-        radiusMeters: 200,
-        enforceLocation: true,
-      },
-      antiProxySettings: {
-        enforceSingleDevicePerDay: true,
-        requireSelfieVerification: true,
-      },
-    };
-
-    const antiProxy = rule.antiProxySettings || {
-      enforceSingleDevicePerDay: true,
-      requireSelfieVerification: true,
-    };
-
-    // 3. Anti-Proxy Verification: Device Fingerprint Lockout
-    // Prevents an employee who arrives early from clocking in for their peers from the same physical device/browser
-    if (antiProxy.enforceSingleDevicePerDay && deviceId) {
-      const conflictingAttendance = await Attendance.findOne({
-        date: todayStr,
-        'deviceInfo.deviceId': deviceId,
-        user: { $ne: user._id },
-      }).populate('user', 'name email');
-
-      if (conflictingAttendance) {
-        return res.status(403).json({
-          success: false,
-          message: `Anti-Proxy Security Alert: This physical device has already been used to clock in for another employee (${conflictingAttendance.user?.name || 'Another User'}) today. Multiple employee check-ins from the same device are strictly prohibited to prevent buddy-punching.`,
-          isProxyBlocked: true,
-          conflictingUser: conflictingAttendance.user?.name,
-        });
-      }
-    }
-
-    // 4. Anti-Proxy Verification: Live Selfie Photo
-    if (antiProxy.requireSelfieVerification && !photo) {
-      return res.status(400).json({
-        success: false,
-        message: 'Selfie verification required: A live webcam photo snapshot must be captured to verify your physical presence and identity.',
-        requireSelfie: true,
-      });
-    }
-
-    const officeLoc = rule.officeLocation || {
-      officeAddress: 'Neximet Head Office, Karachi',
-      latitude: 24.8607,
-      longitude: 67.0011,
-      radiusMeters: 200,
-      enforceLocation: true,
-    };
-
-    let locationData = {
-      latitude: latitude !== undefined && latitude !== null ? Number(latitude) : null,
-      longitude: longitude !== undefined && longitude !== null ? Number(longitude) : null,
-      distanceMeters: null,
-      isVerified: false,
-      officeAddress: officeLoc.officeAddress || 'Neximet Head Office',
-    };
-
-    // 5. Geofence Verification (Ensure employee is physically at the office)
-    if (officeLoc.enforceLocation && !bypassGeofence) {
-      if (latitude === undefined || longitude === undefined || latitude === null || longitude === null) {
-        return res.status(400).json({
-          success: false,
-          message: 'Location verification required: Please enable device location/GPS to check in from the office premises.',
-          officeLocation: officeLoc,
-        });
-      }
-
-      const userLat = Number(latitude);
-      const userLng = Number(longitude);
-
-      if (isNaN(userLat) || isNaN(userLng)) {
-        return res.status(400).json({
-          success: false,
-          message: 'Invalid GPS coordinates received for location verification.',
-        });
-      }
-
-      const distanceMeters = calculateDistanceMeters(
-        userLat,
-        userLng,
-        officeLoc.latitude,
-        officeLoc.longitude
-      );
-
-      locationData.distanceMeters = distanceMeters;
-
-      if (distanceMeters > officeLoc.radiusMeters) {
-        return res.status(403).json({
-          success: false,
-          message: `Check-in rejected: You are ${distanceMeters}m away from the office (${officeLoc.officeAddress}). Check-in is only allowed within ${officeLoc.radiusMeters}m radius of the office.`,
-          distanceMeters,
-          allowedRadius: officeLoc.radiusMeters,
-          officeAddress: officeLoc.officeAddress,
-          isOutOfOffice: true,
-        });
-      }
-
-      locationData.isVerified = true;
-    } else {
-      locationData.isVerified = true;
-    }
-
-    const lateCalc = await calculateLateAndDeductions(checkInDate, user, rule);
-
-    const deviceInfoData = {
-      deviceId: deviceId || '',
-      deviceType: deviceType || 'Desktop/Browser',
-      browser: browser || '',
-      userAgent: req.headers['user-agent'] || '',
-    };
-
-    if (!record) {
-      record = new Attendance({
-        user: user._id,
-        date: todayStr,
-        checkIn: checkInDate,
-        status: lateCalc.status,
-        isLate: lateCalc.isLate,
-        minutesLate: lateCalc.minutesLate,
-        deductionAmount: lateCalc.deductionAmount,
-        deductionPercentage: lateCalc.deductionPercentage,
-        deductionReason: lateCalc.deductionReason,
-        location: locationData,
-        deviceInfo: deviceInfoData,
-        photo: photo || '',
-        notes: notes || '',
-        ipAddress: req.ip || '127.0.0.1',
-      });
-    } else {
-      record.checkIn = checkInDate;
-      record.status = lateCalc.status;
-      record.isLate = lateCalc.isLate;
-      record.minutesLate = lateCalc.minutesLate;
-      record.deductionAmount = lateCalc.deductionAmount;
-      record.deductionPercentage = lateCalc.deductionPercentage;
-      record.deductionReason = lateCalc.deductionReason;
-      record.location = locationData;
-      record.deviceInfo = deviceInfoData;
-      if (photo) record.photo = photo;
-      if (notes) record.notes = notes;
-    }
-
-    await record.save();
-
-    res.status(201).json({
-      success: true,
-      message: record.isLate
-        ? `Checked in with late mark (${record.minutesLate} mins late) [Office Location & Anti-Proxy Verified]`
-        : 'Checked in on time! [Office Location & Anti-Proxy Verified]',
-      attendance: record,
-      distanceFromOffice: locationData.distanceMeters,
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// @desc    Mark Check-Out
-// @route   POST /api/attendance/check-out
-exports.checkOut = async (req, res) => {
-  try {
-    const todayStr = getTodayString();
-    const record = await Attendance.findOne({ user: req.user.id, date: todayStr });
-
-    if (!record || !record.checkIn) {
-      return res.status(400).json({ success: false, message: 'No check-in record found for today' });
-    }
-
-    const checkOutDate = new Date();
-    record.checkOut = checkOutDate;
-
-    // Calculate total hours worked
-    const diffMs = checkOutDate.getTime() - new Date(record.checkIn).getTime();
-    record.totalWorkHours = Number((diffMs / (1000 * 60 * 60)).toFixed(2));
-
-    await record.save();
-
-    res.json({
-      success: true,
-      message: `Checked out successfully. Total hours: ${record.totalWorkHours}h`,
-      attendance: record,
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// @desc    Get current user's today attendance status
-// @route   GET /api/attendance/today
-exports.getTodayStatus = async (req, res) => {
-  try {
-    const todayStr = getTodayString();
-    const record = await Attendance.findOne({ user: req.user.id, date: todayStr });
-    const user = await User.findById(req.user.id);
-    const rule = await DeductionRule.findOne({ isActive: true });
-
-    const officeLocation = rule?.officeLocation || {
-      officeAddress: 'Neximet Head Office, Karachi',
-      latitude: 24.8607,
-      longitude: 67.0011,
-      radiusMeters: 200,
-      enforceLocation: true,
-    };
-
-    const antiProxySettings = rule?.antiProxySettings || {
-      enforceSingleDevicePerDay: true,
-      requireSelfieVerification: true,
-    };
-
-    res.json({
-      success: true,
-      attendance: record,
-      officeLocation,
-      antiProxySettings,
-      leaveBalances: user ? user.leaveBalances : { casual: 0, sick: 0, annual: 0 },
-      dailyWage: user ? user.dailyWage : 4000,
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// @desc    Get attendance history (self or all if CEO/Manager)
-// @route   GET /api/attendance/history
-exports.getHistory = async (req, res) => {
-  try {
-    const { userId, month, department, status } = req.query;
-    const filter = {};
-
-    // Non-CEO/Super Admin can only view their own
-    const isExecutive = ['CEO', 'Super Admin'].includes(req.user.role);
-    if (!isExecutive) {
-      filter.user = req.user.id;
-    } else if (userId && userId !== 'all') {
-      filter.user = userId;
-    }
-
-    if (month) {
-      filter.date = { $regex: `^${month}` }; // e.g. "2026-09"
-    }
-
-    if (status && status !== 'All') {
-      filter.status = status;
-    }
-
-    const records = await Attendance.find(filter)
-      .populate('user', 'name email department designation dailyWage')
-      .sort({ date: -1, checkIn: -1 })
-      .limit(100);
-
-    // If department filter requested, filter populated user
-    let filteredRecords = records;
-    if (department && department !== 'All') {
-      filteredRecords = records.filter((r) => r.user && r.user.department === department);
-    }
-
-    // Summary stats
-    const totalRecords = filteredRecords.length;
-    const lateRecords = filteredRecords.filter((r) => r.isLate).length;
-    const totalDeductions = filteredRecords.reduce((sum, r) => sum + (r.deductionAmount || 0), 0);
-
-    res.json({
-      success: true,
-      count: totalRecords,
-      lateCount: lateRecords,
-      totalDeductions,
-      records: filteredRecords,
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// @desc    Get daily roster for all employees
-// @route   GET /api/attendance/roster
-exports.getDailyRoster = async (req, res) => {
-  try {
-    const dateStr = req.query.date || getTodayString();
-    const users = await User.find({ isActive: true }).select('name email department designation dailyWage');
-    const records = await Attendance.find({ date: dateStr });
-
-    const recordMap = {};
-    records.forEach((r) => {
-      recordMap[r.user.toString()] = r;
-    });
-
-    const roster = users.map((u) => {
-      const rec = recordMap[u._id.toString()];
-      return {
-        user: u,
-        date: dateStr,
-        checkedIn: !!(rec && rec.checkIn && rec.status !== 'absent'),
-        checkIn: rec ? rec.checkIn : null,
-        checkOut: rec ? rec.checkOut : null,
-        status: rec ? rec.status : 'not_checked_in',
-        isLate: rec ? rec.isLate : false,
-        minutesLate: rec ? rec.minutesLate : 0,
-        deductionAmount: rec ? rec.deductionAmount : 0,
-        totalWorkHours: rec ? rec.totalWorkHours : 0,
-        photo: rec ? rec.photo : '',
-        deviceInfo: rec ? rec.deviceInfo : null,
-        location: rec ? rec.location : null,
-        notes: rec ? rec.notes : '',
-      };
-    });
-
-    res.json({ success: true, date: dateStr, roster });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// @desc    CEO / Admin Mark Employee Absent (revert/override attendance to absent)
-// @route   POST /api/attendance/mark-absent
-exports.markAbsent = async (req, res) => {
-  try {
-    const { userId, date, notes } = req.body;
-    if (!userId) {
-      return res.status(400).json({ success: false, message: 'Employee User ID is required.' });
-    }
-
-    const targetDate = date || getTodayString();
-    const targetUser = await User.findById(userId);
-    if (!targetUser) {
-      return res.status(404).json({ success: false, message: 'Employee not found.' });
-    }
-
-    const dailyWage = targetUser.dailyWage || (targetUser.baseSalary ? Math.round(targetUser.baseSalary / 30) : 4000);
-
-    let record = await Attendance.findOne({ user: userId, date: targetDate });
-    if (!record) {
-      record = new Attendance({
-        user: userId,
-        date: targetDate,
-      });
-    }
-
-    record.status = 'absent';
-    record.checkIn = null;
-    record.checkOut = null;
-    record.isLate = false;
-    record.minutesLate = 0;
-    record.deductionAmount = dailyWage;
-    record.deductionPercentage = 100;
-    record.deductionReason = notes || 'Marked absent by CEO executive override';
-    record.notes = notes || 'Marked absent by CEO';
-    record.photo = '';
-    if (record.location) {
-      record.location.isVerified = false;
-    }
-
-    await record.save();
-
-    res.json({
-      success: true,
-      message: `${targetUser.name} has been marked absent for ${targetDate}. Daily wage deduction of PKR ${dailyWage.toLocaleString()} applied.`,
-      attendance: record,
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// @desc    CEO / Admin Mark Employee Present (revert absence back to present)
-// @route   POST /api/attendance/mark-present
-exports.markPresent = async (req, res) => {
-  try {
-    const { userId, date, notes } = req.body;
-    if (!userId) {
-      return res.status(400).json({ success: false, message: 'Employee User ID is required.' });
-    }
-
-    const targetDate = date || getTodayString();
-    const targetUser = await User.findById(userId);
-    if (!targetUser) {
-      return res.status(404).json({ success: false, message: 'Employee not found.' });
-    }
-
-    let record = await Attendance.findOne({ user: userId, date: targetDate });
-    if (!record) {
-      record = new Attendance({
-        user: userId,
-        date: targetDate,
-      });
-    }
-
-    const now = new Date();
-    record.status = 'present';
-    record.checkIn = record.checkIn || now;
-    record.isLate = false;
-    record.minutesLate = 0;
-    record.deductionAmount = 0;
-    record.deductionPercentage = 0;
-    record.deductionReason = notes || 'Marked present by CEO executive override';
-    record.notes = notes || 'Marked present by CEO';
-
-    await record.save();
-
-    res.json({
-      success: true,
-      message: `${targetUser.name} has been marked present for ${targetDate}.`,
-      attendance: record,
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
+  const event = { action: absent ? 'mark_absent' : record?.override?.snapshot?.status ? 'restore' : 'mark_present', by: req.user.id, at: new Date(), reason, previousStatus, previousState };
+  const updated = record
+    ? await Attendance.findOneAndUpdate({ _id: record._id, __v: record.__v === undefined ? { $exists: false } : record.__v }, { $set: fields, $inc: { __v: 1 }, $push: { auditTrail: event } }, { new: true, runValidators: true }).select('-auditTrail -override.snapshot')
+    : await Attendance.create({ user: userId, date, ...fields, auditTrail: [event] });
+  if (!updated) fail('Attendance changed concurrently. Refresh and try again.', 409);
+  await closeEndedShifts(rule, { user: userId });
+  const saved = await Attendance.findById(updated._id).select('-auditTrail -override.snapshot');
+  res.json({ success: true, message: targetUser.name + ': ' + (absent ? 'marked absent' : 'attendance restored') + ' for ' + date + '. Original check-in evidence retained.', attendance: saved });
+}
+exports.markAbsent = wrap((req, res) => overrideAttendance(req, res, true));
+exports.markPresent = wrap((req, res) => overrideAttendance(req, res, false));

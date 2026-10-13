@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 
 const deductionRuleSchema = new mongoose.Schema({
+  policyKey: String,
   title: {
     type: String,
     default: 'Standard Company Attendance Policy',
@@ -94,6 +95,12 @@ const deductionRuleSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
   },
-}, { timestamps: true });
+}, { timestamps: true, optimisticConcurrency: true });
+
+deductionRuleSchema.index({ policyKey: 1 }, { unique: true, partialFilterExpression: { policyKey: { $type: 'string' } } });
+deductionRuleSchema.pre('validate', function () {
+  const { normalizeRule, validateRule } = require('../services/attendancePolicy');
+  validateRule(normalizeRule(this));
+});
 
 module.exports = mongoose.model('DeductionRule', deductionRuleSchema);

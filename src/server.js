@@ -33,6 +33,8 @@ app.use(cors({
 }));
 app.options('*', cors());
 
+// Attendance validates the selfie size; other APIs retain the default JSON limit.
+app.use('/api/attendance/check-in', express.json({ limit: '1mb' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan('dev'));

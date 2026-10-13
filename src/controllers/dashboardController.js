@@ -3,19 +3,16 @@ const Attendance = require('../models/Attendance');
 const User = require('../models/User');
 const LeaveRequest = require('../models/LeaveRequest');
 
-const getTodayString = (date = new Date()) => {
-  const d = new Date(date);
-  const year = d.getFullYear();
-  const month = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${year}-${month}-${day}`;
-};
+const { companyDate: getTodayString, shiftDate, scheduledEnd } = require('../services/attendancePolicy');
+const { activeRule, closeEndedShifts, dailyRoster } = require('../services/attendanceRecords');
 
 // @desc    Get roll-up dashboard metrics tailored to logged-in user role and department
 // @route   GET /api/dashboard/stats
 exports.getStats = async (req, res) => {
   try {
-    const todayStr = getTodayString();
+    const rule = await activeRule();
+    const todayStr = shiftDate(new Date(), rule);
+    await closeEndedShifts(rule);
     const currentMonthPrefix = todayStr.substring(0, 7);
 
     const currentUser = req.user;
@@ -78,7 +75,7 @@ exports.getStats = async (req, res) => {
 
     // 3. Attendance & Telemetry Scoping
     // A. Personal Attendance
-    const myTodayRecord = await Attendance.findOne({ user: currentUser._id, date: todayStr });
+    let myTodayRecord = await Attendance.findOne({ user: currentUser._id, date: todayStr });
     const myMonthRecords = await Attendance.find({
       user: currentUser._id,
       date: { $regex: `^${currentMonthPrefix}` },
@@ -94,21 +91,31 @@ exports.getStats = async (req, res) => {
     const deptTotalEmployees = deptUsers.length;
 
     // C. Company-wide Attendance
-    const totalEmployees = await User.countDocuments({ isActive: true, role: { $ne: 'CEO' } });
-    const todayRecords = await Attendance.find({ date: todayStr }).populate('user', 'name role department');
+    const companyRoster = await dailyRoster(todayStr);
+    // CEO testing must not inflate company employee attendance counts.
+    const todayRecords = companyRoster.filter(row => row.user.role !== 'CEO');
+    const totalEmployees = todayRecords.length;
     const presentCount = todayRecords.filter((r) => r.status === 'present').length;
     const lateCount = todayRecords.filter((r) => r.isLate).length;
     const halfDayCount = todayRecords.filter((r) => r.status === 'half_day').length;
-    const checkedInCount = todayRecords.filter((r) => r.status !== 'absent' && r.checkIn).length;
-    const absentCount = Math.max(0, totalEmployees - checkedInCount);
+    const checkedInCount = todayRecords.filter((r) => r.checkedIn).length;
+    const shiftEnded = new Date() >= scheduledEnd(todayStr, rule);
+    const absentCount = todayRecords.filter((r) => r.status === 'absent' || (shiftEnded && r.status === 'not_checked_in')).length;
+    const notCheckedInCount = todayRecords.filter((r) => r.status === 'not_checked_in').length;
+    const onLeaveCount = todayRecords.filter((r) => r.status === 'on_leave').length;
+    const onHolidayCount = todayRecords.filter((r) => r.status === 'on_holiday').length;
+    if (!myTodayRecord) {
+      const own = companyRoster.find(r => String(r.user._id) === String(currentUser._id));
+      if (own && ['on_leave', 'on_holiday'].includes(own.status)) myTodayRecord = own;
+    }
     const todayDeductionTotal = todayRecords.reduce((sum, r) => sum + (r.deductionAmount || 0), 0);
 
     // Department-scoped today attendance
     const deptTodayRecords = todayRecords.filter((r) => r.user && r.user.department === userDept);
-    const deptCheckedInCount = deptTodayRecords.filter((r) => r.status !== 'absent' && r.checkIn).length;
+    const deptCheckedInCount = deptTodayRecords.filter((r) => r.checkedIn).length;
     const deptPresentCount = deptTodayRecords.filter((r) => r.status === 'present').length;
     const deptLateCount = deptTodayRecords.filter((r) => r.isLate).length;
-    const deptAbsentCount = Math.max(0, deptTotalEmployees - deptCheckedInCount);
+    const deptAbsentCount = deptTodayRecords.filter((r) => r.status === 'absent' || (shiftEnded && r.status === 'not_checked_in')).length;
 
     // Company monthly deductions (only computed for CEO/Super Admin)
     let companyMonthlyDeductionsTotal = 0;
@@ -116,6 +123,7 @@ exports.getStats = async (req, res) => {
       const monthRecords = await Attendance.find({
         date: { $regex: `^${currentMonthPrefix}` },
         deductionAmount: { $gt: 0 },
+        isSimulated: { $ne: true },
       });
       companyMonthlyDeductionsTotal = monthRecords.reduce((sum, r) => sum + (r.deductionAmount || 0), 0);
     }
@@ -190,6 +198,9 @@ exports.getStats = async (req, res) => {
         lateCount,
         halfDayCount,
         absentCount,
+        notCheckedInCount,
+        onLeaveCount,
+        onHolidayCount,
         todayDeductions: todayDeductionTotal,
         monthlyDeductions: companyMonthlyDeductionsTotal,
 
