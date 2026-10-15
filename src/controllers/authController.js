@@ -1,8 +1,20 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const mongoose = require('mongoose');
+const { jwtSecret } = require('../services/authSecret');
+const { fail } = require('../services/attendancePolicy');
+const finiteAmount = (value, label, nullable = false) => {
+  if (nullable && (value == null || value === '')) return null;
+  if (!['number', 'string'].includes(typeof value) || (typeof value === 'string' && !value.trim()) || !Number.isFinite(Number(value)) || Number(value) < 0) fail(`${label} must be a finite, non-negative number.`);
+  return Number(value);
+};
+const balancesFrom = (input, previous = { casual: 10, sick: 8, annual: 14 }) => {
+  if (typeof input !== 'object' || !input || Array.isArray(input)) fail('Leave balances must be an object.');
+  return Object.fromEntries(['casual', 'sick', 'annual'].map(key => [key, input[key] === undefined ? previous[key] : finiteAmount(input[key], `${key} leave balance`)]));
+};
 
 const generateToken = (id) => {
-  return jwt.sign({ id }, process.env.JWT_SECRET || 'neximet_super_secret_jwt_key_2026_enterprise_portal', {
+  return jwt.sign({ id }, jwtSecret(), {
     expiresIn: process.env.JWT_EXPIRES_IN || '7d',
   });
 };
@@ -47,7 +59,7 @@ exports.login = async (req, res) => {
       },
     });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(error.status || 500).json({ success: false, message: error.message });
   }
 };
 
@@ -137,9 +149,9 @@ exports.createEmployee = async (req, res) => {
       });
     }
 
-    const salary = (baseSalary !== undefined && baseSalary !== null && baseSalary !== '') ? Number(baseSalary) : null;
-    const wage = (dailyWage !== undefined && dailyWage !== null && dailyWage !== '') ? Number(dailyWage) : (salary ? Math.round(salary / 30) : null);
-    const leaves = leaveBalances || { casual: 10, sick: 8, annual: 14 };
+    const salary = finiteAmount(baseSalary, 'Base salary', true);
+    const wage = dailyWage == null || dailyWage === '' ? salary === null ? null : Math.round(salary / 30) : finiteAmount(dailyWage, 'Daily wage', true);
+    const leaves = leaveBalances === undefined ? { casual: 10, sick: 8, annual: 14 } : balancesFrom(leaveBalances);
 
     const newUser = await User.create({
       name: name.trim(),
@@ -165,7 +177,7 @@ exports.createEmployee = async (req, res) => {
       user: userObj,
     });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(error.status || (['ValidationError', 'CastError'].includes(error.name) ? 400 : 500)).json({ success: false, message: error.message });
   }
 };
 
@@ -174,59 +186,67 @@ exports.createEmployee = async (req, res) => {
 exports.updateUser = async (req, res) => {
   try {
     const { id } = req.params;
-    const user = await User.findById(id);
+    const updatedUser = await mongoose.connection.transaction(async transaction => {
+      const user = await User.findOneAndUpdate({ _id: id }, { $inc: { attendanceVersion: 1 } }, { new: true, session: transaction }).select('+employmentGaps +attendanceTrackingFrom');
 
-    if (!user) {
-      return res.status(404).json({ success: false, message: 'Employee not found.' });
-    }
+      if (!user) {
+        fail('Employee not found.', 404);
+      }
 
-    const {
-      name,
-      role,
-      department,
-      designation,
-      baseSalary,
-      dailyWage,
-      phone,
-      leaveBalances,
-      reportsTo,
-      isActive,
-    } = req.body;
+      const {
+        name,
+        role,
+        department,
+        designation,
+        baseSalary,
+        dailyWage,
+        phone,
+        leaveBalances,
+        reportsTo,
+        isActive,
+      } = req.body;
 
-    if (name) user.name = name.trim();
-    if (role) user.role = role;
-    if (department) user.department = department;
-    if (designation) user.designation = designation.trim();
-    if (phone) user.phone = phone.trim();
-    if (typeof isActive === 'boolean') user.isActive = isActive;
+      const snapshot = value => value === '' || value == null ? null : Number.isFinite(Number(value)) ? Number(value) : String(value);
+      for (const key of ['baseSalary', 'dailyWage']) if (req.body.expectedPay?.[key] !== undefined && snapshot(user[key]) !== snapshot(req.body.expectedPay[key])) fail('Employee pay changed since this form opened. Reload before saving.', 409);
+      for (const key of ['casual', 'sick', 'annual']) if (req.body.expectedLeaveBalances?.[key] !== undefined && snapshot(user.leaveBalances?.[key]) !== snapshot(req.body.expectedLeaveBalances[key])) fail('Leave balance changed since this form opened. Reload before saving.', 409);
 
-    if (baseSalary !== undefined) {
-      user.baseSalary = (baseSalary === null || baseSalary === '') ? null : Number(baseSalary);
-    }
+      if (name) user.name = name.trim();
+      if (role) user.role = role;
+      if (department) user.department = department;
+      if (designation) user.designation = designation.trim();
+      if (phone) user.phone = phone.trim();
+      if (typeof isActive === 'boolean') {
+        if (!isActive && user.isActive) user.deactivatedAt = new Date();
+        if (isActive && !user.isActive) {
+          if (user.deactivatedAt) user.employmentGaps = [...(user.employmentGaps || []), { start: user.deactivatedAt, end: new Date() }];
+          else user.attendanceTrackingFrom = new Date();
+          user.deactivatedAt = undefined;
+        }
+        user.isActive = isActive;
+      }
 
-    if (dailyWage !== undefined) {
-      user.dailyWage = (dailyWage === null || dailyWage === '') ? null : Number(dailyWage);
-    } else if (user.baseSalary && !user.dailyWage) {
-      user.dailyWage = Math.round(user.baseSalary / 30);
-    }
+      if (baseSalary !== undefined) {
+        user.baseSalary = finiteAmount(baseSalary, 'Base salary', true);
+      }
 
-    if (leaveBalances) {
-      user.leaveBalances = {
-        casual: Number(leaveBalances.casual) >= 0 ? Number(leaveBalances.casual) : (user.leaveBalances?.casual ?? 10),
-        sick: Number(leaveBalances.sick) >= 0 ? Number(leaveBalances.sick) : (user.leaveBalances?.sick ?? 8),
-        annual: Number(leaveBalances.annual) >= 0 ? Number(leaveBalances.annual) : (user.leaveBalances?.annual ?? 14),
-      };
-    }
+      if (dailyWage !== undefined) {
+        user.dailyWage = finiteAmount(dailyWage, 'Daily wage', true);
+      } else if (baseSalary !== undefined && user.baseSalary !== null && user.dailyWage == null) {
+        user.dailyWage = Math.round(user.baseSalary / 30);
+      }
 
-    if (reportsTo !== undefined) {
-      user.reportsTo = reportsTo || null;
-    }
+      if (leaveBalances !== undefined) user.leaveBalances = balancesFrom(leaveBalances, user.leaveBalances || { casual: 10, sick: 8, annual: 14 });
 
-    await user.save();
+      if (reportsTo !== undefined) {
+        user.reportsTo = reportsTo || null;
+      }
 
-    const updatedUser = await User.findById(id)
-      .select('-password')
-      .populate('reportsTo', 'name email role designation');
+      await user.save({ session: transaction });
+
+      return User.findById(id).session(transaction)
+        .select('-password')
+        .populate('reportsTo', 'name email role designation');
+    });
 
     res.json({
       success: true,
@@ -234,7 +254,7 @@ exports.updateUser = async (req, res) => {
       user: updatedUser,
     });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(error.status || (error.code === 20 ? 503 : ['ValidationError', 'CastError'].includes(error.name) ? 400 : 500)).json({ success: false, message: error.code === 20 ? 'Employee compensation updates require MongoDB Atlas or a replica set.' : error.message });
   }
 };
 

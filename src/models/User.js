@@ -43,10 +43,14 @@ const userSchema = new mongoose.Schema({
   baseSalary: {
     type: Number,
     default: null,
+    min: 0,
+    validate: { validator: value => value == null || Number.isFinite(value), message: 'Base salary must be finite.' },
   },
   dailyWage: {
     type: Number,
     default: null,
+    min: 0,
+    validate: { validator: value => value == null || Number.isFinite(value), message: 'Daily wage must be finite.' },
   },
   reportsTo: {
     type: mongoose.Schema.Types.ObjectId,
@@ -58,9 +62,9 @@ const userSchema = new mongoose.Schema({
     default: '+92 (300) 123-4567',
   },
   leaveBalances: {
-    casual: { type: Number, default: 10 },
-    sick: { type: Number, default: 8 },
-    annual: { type: Number, default: 14 },
+    casual: { type: Number, default: 10, min: 0, validate: { validator: Number.isFinite, message: 'Casual balance must be finite.' } },
+    sick: { type: Number, default: 8, min: 0, validate: { validator: Number.isFinite, message: 'Sick balance must be finite.' } },
+    annual: { type: Number, default: 14, min: 0, validate: { validator: Number.isFinite, message: 'Annual balance must be finite.' } },
   },
   joinDate: {
     type: Date,
@@ -70,6 +74,12 @@ const userSchema = new mongoose.Schema({
     type: Boolean,
     default: true,
   },
+  deactivatedAt: Date,
+  attendanceVersion: { type: Number, default: 0, select: false },
+  attendanceCalendarThrough: { type: String, select: false },
+  attendanceCalendarRevision: { type: Number, default: 0, select: false },
+  attendanceTrackingFrom: { type: Date, select: false },
+  employmentGaps: { type: [{ start: Date, end: Date }], select: false, default: undefined },
   passwordResetRequest: {
     status: {
       type: String,

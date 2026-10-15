@@ -3,10 +3,11 @@ const Attendance = require('../models/Attendance');
 const User = require('../models/User');
 const { TIME_ZONE, fail, shiftDate, validMonth, normalizeRule, validateRule, calculateDeduction } = require('../services/attendancePolicy');
 const { activeRule, closeEndedShifts } = require('../services/attendanceRecords');
+const { materializeHistory } = require('../services/attendanceHistory');
 const wrap = handler => async (req, res) => {
   try { await handler(req, res); } catch (error) { res.status(error.status || (error.code === 11000 || error.name === 'VersionError' ? 409 : error.name === 'ValidationError' ? 400 : 500)).json({ success: false, message: error.name === 'VersionError' ? 'Policy changed in another session. Reload before saving.' : error.message }); }
 };
-const fields = ['title','shiftStartTime','shiftEndTime','gracePeriodMinutes','lateThresholdMinutes','deductionType','percentageDeductionRate','fixedDeductionAmount','halfDayThresholdMinutes','fullDayAbsentThresholdMinutes','consecutiveLateThreshold','consecutivePenaltyMultiplier','currencySymbol','officeLocation','antiProxySettings'];
+const fields = ['title','workingDays','shiftStartTime','shiftEndTime','gracePeriodMinutes','lateThresholdMinutes','deductionType','percentageDeductionRate','fixedDeductionAmount','halfDayThresholdMinutes','fullDayAbsentThresholdMinutes','consecutiveLateThreshold','consecutivePenaltyMultiplier','currencySymbol','officeLocation','antiProxySettings'];
 
 exports.getActiveRule = wrap(async (req, res) => {
   // A read must not create duplicate default policies during concurrent cold starts.
@@ -43,25 +44,27 @@ exports.getMonthlyReport = wrap(async (req, res) => {
   if (!validMonth(month)) fail('Month must be a valid YYYY-MM.');
   const allowed = ['CEO','Super Admin','Project Manager'].includes(req.user.role);
   if (!allowed) fail('Access denied.', 403);
-  const filter = { date: { $regex: '^' + month }, deductionAmount: { $gt: 0 }, isSimulated: { $ne: true } };
+  const filter = { date: { $regex: '^' + month }, $or: [{ deductionAmount: { $gt: 0 } }, { status: 'absent' }], isSimulated: { $ne: true }, 'quarantine.at': { $exists: false } };
   if (req.user.role === 'Project Manager') {
     const employees = await User.find({ department: req.user.department }).select('_id');
     filter.user = { $in: employees.map(user => user._id) };
   }
   await closeEndedShifts(rule, filter.user ? { user: filter.user } : {});
-  const records = await Attendance.find(filter).select('date user checkIn status isLate minutesLate deductionAmount deductionReason')
+  await materializeHistory(rule, filter);
+  const records = await Attendance.find(filter).select('date user checkIn status isLate minutesLate deductionAmount deductionReason financialReviewRequired')
     .populate('user', 'name email department designation baseSalary dailyWage').sort({ date: 1, _id: 1 });
   const grouped = new Map();
   for (const record of records) {
     if (!record.user) continue;
     const key = String(record.user._id);
-    if (!grouped.has(key)) grouped.set(key, { user: record.user, totalLateIncidents: 0, totalAbsentIncidents: 0, totalMinutesLate: 0, totalDeductions: 0, incidents: [] });
+    if (!grouped.has(key)) grouped.set(key, { user: record.user, totalLateIncidents: 0, totalAbsentIncidents: 0, reviewRequiredCount: 0, totalMinutesLate: 0, totalDeductions: 0, incidents: [] });
     const item = grouped.get(key);
     item.totalLateIncidents += record.isLate ? 1 : 0;
     item.totalAbsentIncidents += record.status === 'absent' ? 1 : 0;
+    item.reviewRequiredCount += record.financialReviewRequired ? 1 : 0;
     item.totalMinutesLate += record.minutesLate || 0; item.totalDeductions += record.deductionAmount || 0;
     item.incidents.push({ date: record.date, checkIn: record.checkIn, status: record.status, minutesLate: record.minutesLate, deductionAmount: record.deductionAmount, reason: record.deductionReason });
   }
   const report = [...grouped.values()];
-  res.json({ success: true, month, timeZone: TIME_ZONE, grandTotalDeductions: report.reduce((sum, item) => sum + item.totalDeductions, 0), employeesPenalizedCount: report.length, report });
+  res.json({ success: true, month, timeZone: TIME_ZONE, grandTotalDeductions: report.reduce((sum, item) => sum + item.totalDeductions, 0), employeesPenalizedCount: report.filter(item => item.totalDeductions > 0).length, report });
 });

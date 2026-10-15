@@ -1,6 +1,7 @@
 // All attendance calendar calculations use the company's timezone, never the host's TZ.
 const TIME_ZONE = 'Asia/Karachi';
 const DEFAULT_RULE = {
+  workingDays: [1, 2, 3, 4, 5],
   shiftStartTime: '09:00', shiftEndTime: '18:00', gracePeriodMinutes: 15,
   lateThresholdMinutes: 30, deductionType: 'percentage', percentageDeductionRate: 5,
   fixedDeductionAmount: 1000, halfDayThresholdMinutes: 60, fullDayAbsentThresholdMinutes: 180,
@@ -24,6 +25,7 @@ function timeMinutes(value) {
   const [h, m] = value.split(':').map(Number); return h * 60 + m;
 }
 function addDays(date, days) { const d = new Date(`${date}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); }
+function isWorkingDay(date, rule) { return rule.workingDays.includes(new Date(`${date}T00:00:00Z`).getUTCDay()); }
 function shiftDate(date, rule) {
   const p = companyParts(date), minutes = Number(p.hour) * 60 + Number(p.minute);
   const start = timeMinutes(rule.shiftStartTime), end = timeMinutes(rule.shiftEndTime);
@@ -44,12 +46,32 @@ function atCompanyTime(date, time) {
   return new Date(instant);
 }
 function scheduledEnd(date, rule) { return atCompanyTime(timeMinutes(rule.shiftEndTime) <= timeMinutes(rule.shiftStartTime) ? addDays(date, 1) : date, rule.shiftEndTime); }
+function recordedScheduleEnd(record, fallbackRule) { return record.scheduledCheckOut || scheduledEnd(record.date, normalizeRule(record.policySnapshot || fallbackRule)); }
+function recordedShift(record, fallbackRule) {
+  if (!validDate(record.date) || !record.checkIn || !Number.isFinite(new Date(record.checkIn).getTime())) fail('Invalid legacy working date or check-in timestamp. Administrator repair required.');
+  if (record.expectedCheckIn != null && !Number.isFinite(new Date(record.expectedCheckIn).getTime())) fail('Invalid legacy expected arrival timestamp. Administrator repair required.');
+  const scheduled = recordedScheduleEnd(record, fallbackRule);
+  const end = new Date(Math.max(new Date(scheduled).getTime(), new Date(record.checkIn).getTime()));
+  if (!Number.isFinite(end.getTime())) fail('Invalid legacy scheduled shift end. Administrator repair required.');
+  const totalWorkHours = workHours(record, end, fallbackRule);
+  if (!Number.isFinite(totalWorkHours)) fail('Invalid legacy work-hour evidence. Administrator repair required.');
+  return { end, totalWorkHours };
+}
+function workHours(record, end, fallbackRule) {
+  let start = new Date(record.checkIn).getTime();
+  const expected = new Date(record.expectedCheckIn).getTime();
+  // Morning leave excludes the excused first half, while ordinary early
+  // arrivals retain their actual worked time. Never replace arrival evidence.
+  if (record.expectedCheckIn && validDate(record.date) && expected > atCompanyTime(record.date, normalizeRule(record.policySnapshot || fallbackRule).shiftStartTime).getTime()) start = Math.max(start, expected);
+  return Math.max(0, Number(((new Date(end).getTime() - start) / 3600000).toFixed(2)));
+}
 function normalizeRule(input = {}) {
   input = input || {};
   const value = input.toObject ? input.toObject() : input;
   return { ...DEFAULT_RULE, ...value, officeLocation: { ...DEFAULT_RULE.officeLocation, ...value.officeLocation }, antiProxySettings: { ...DEFAULT_RULE.antiProxySettings, ...value.antiProxySettings } };
 }
 function validateRule(rule) {
+  if (!Array.isArray(rule.workingDays) || !rule.workingDays.length || new Set(rule.workingDays).size !== rule.workingDays.length || rule.workingDays.some(day => !Number.isInteger(day) || day < 0 || day > 6)) fail('Working days must be distinct weekdays numbered 0–6.');
   timeMinutes(rule.shiftStartTime); timeMinutes(rule.shiftEndTime);
   if (rule.shiftStartTime === rule.shiftEndTime) fail('Shift start and end must be different.');
   for (const key of ['gracePeriodMinutes', 'lateThresholdMinutes', 'halfDayThresholdMinutes', 'fullDayAbsentThresholdMinutes', 'consecutiveLateThreshold']) {
@@ -91,10 +113,10 @@ function calculateAttendance(date, user, rule, priorLateCount = 0) {
 }
 function distanceMeters(lat1, lon1, lat2, lon2) {
   const rad = x => x * Math.PI / 180;
-  const a = Math.sin(rad(lat2 - lat1) / 2) ** 2 + Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(rad(lon2 - lon1) / 2) ** 2;
+  const a = Math.min(1, Math.max(0, Math.sin(rad(lat2 - lat1) / 2) ** 2 + Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(rad(lon2 - lon1) / 2) ** 2));
   return Math.round(6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
 }
-function validateSelfie(photo) {
+async function validateSelfie(photo) {
   if (typeof photo !== 'string') fail('Capture a selfie before checking in.');
   const match = /^data:image\/(jpeg|png);base64,([A-Za-z0-9+/]+={0,2})$/.exec(photo);
   if (!match || match[2].length % 4 !== 0 || match[2].length > 700000) fail('Selfie must be a JPEG or PNG image of at most 500 KB.');
@@ -113,6 +135,13 @@ function validateSelfie(photo) {
     }
   }
   if (width < 32 || height < 32 || width > 2048 || height > 2048) fail('Selfie image is invalid or its dimensions are unsupported.');
+  try {
+    const decoder = require('sharp')(bytes, { limitInputPixels: 2048 * 2048, failOn: 'warning' });
+    const metadata = await decoder.metadata();
+    if (metadata.format !== match[1] || metadata.width !== width || metadata.height !== height || (metadata.pages || 1) !== 1) fail('Invalid selfie image.');
+    // Metadata alone only reads headers. Decoding pixels detects truncated/corrupt data.
+    await decoder.raw().toBuffer();
+  } catch { fail('Selfie image could not be decoded. Capture a new photo.'); }
   return photo;
 }
-module.exports = { TIME_ZONE, DEFAULT_RULE, fail, companyDate, validDate, validMonth, addDays, shiftDate, scheduledEnd, atCompanyTime, normalizeRule, validateRule, dailyWage, calculateDeduction, calculateAttendance, distanceMeters, validateSelfie };
+module.exports = { TIME_ZONE, DEFAULT_RULE, fail, companyDate, validDate, validMonth, addDays, isWorkingDay, shiftDate, scheduledEnd, recordedScheduleEnd, recordedShift, atCompanyTime, workHours, normalizeRule, validateRule, dailyWage, calculateDeduction, calculateAttendance, distanceMeters, validateSelfie };

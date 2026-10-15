@@ -3,20 +3,23 @@ const Attendance = require('../models/Attendance');
 const User = require('../models/User');
 const LeaveRequest = require('../models/LeaveRequest');
 
-const { companyDate: getTodayString, shiftDate, scheduledEnd } = require('../services/attendancePolicy');
-const { activeRule, closeEndedShifts, dailyRoster } = require('../services/attendanceRecords');
+const { shiftDate, scheduledEnd, isWorkingDay } = require('../services/attendancePolicy');
+const { activeRule, closeEndedShifts, dailyRoster, dayExemptions } = require('../services/attendanceRecords');
+const { materializeHistory } = require('../services/attendanceHistory');
 
 // @desc    Get roll-up dashboard metrics tailored to logged-in user role and department
 // @route   GET /api/dashboard/stats
 exports.getStats = async (req, res) => {
   try {
-    const rule = await activeRule();
-    const todayStr = shiftDate(new Date(), rule);
-    await closeEndedShifts(rule);
-    const currentMonthPrefix = todayStr.substring(0, 7);
-
     const currentUser = req.user;
     const isExecutive = ['CEO', 'Super Admin'].includes(currentUser?.role);
+    const rule = await activeRule();
+    const todayStr = shiftDate(new Date(), rule);
+    const personalScope = isExecutive ? {} : { user: currentUser._id };
+    await closeEndedShifts(rule, personalScope);
+    await materializeHistory(rule, { ...personalScope, date: { $gte: todayStr, $lte: todayStr } });
+    const currentMonthPrefix = todayStr.substring(0, 7);
+
     const isManager = ['Project Manager', 'Team Manager'].includes(currentUser?.role);
     const userDept = currentUser?.department;
 
@@ -79,22 +82,20 @@ exports.getStats = async (req, res) => {
     const myMonthRecords = await Attendance.find({
       user: currentUser._id,
       date: { $regex: `^${currentMonthPrefix}` },
+      isSimulated: { $ne: true },
+      'quarantine.at': { $exists: false },
     });
     const myMonthlyPresentCount = myMonthRecords.filter((r) => ['present', 'late', 'half_day'].includes(r.status)).length;
     const myMonthlyLateCount = myMonthRecords.filter((r) => r.isLate).length;
     const myMonthlyDeductionsTotal = myMonthRecords.reduce((sum, r) => sum + (r.deductionAmount || 0), 0);
+    const myLeaveBalances = (await User.findById(currentUser._id).select('leaveBalances').lean())?.leaveBalances || { casual: 0, sick: 0, annual: 0 };
 
-    // B. Department Attendance & Squad Members
-    const deptUsers = (!isExecutive && userDept && userDept !== 'Executive')
-      ? await User.find({ department: userDept, isActive: true }).select('name email role designation department phone')
-      : [];
-    const deptTotalEmployees = deptUsers.length;
-
-    // C. Company-wide Attendance
-    const companyRoster = await dailyRoster(todayStr);
+    // B. Company-wide Attendance
+    const companyRoster = isExecutive ? await dailyRoster(todayStr) : [];
     // CEO testing must not inflate company employee attendance counts.
-    const todayRecords = companyRoster.filter(row => row.user.role !== 'CEO');
-    const totalEmployees = todayRecords.length;
+    const employeeRoster = companyRoster.filter(row => row.user.role !== 'CEO');
+    const totalEmployees = employeeRoster.length;
+    const todayRecords = employeeRoster.filter(row => !row.quarantine?.at && !row.isSimulated);
     const presentCount = todayRecords.filter((r) => r.status === 'present').length;
     const lateCount = todayRecords.filter((r) => r.isLate).length;
     const halfDayCount = todayRecords.filter((r) => r.status === 'half_day').length;
@@ -105,17 +106,16 @@ exports.getStats = async (req, res) => {
     const onLeaveCount = todayRecords.filter((r) => r.status === 'on_leave').length;
     const onHolidayCount = todayRecords.filter((r) => r.status === 'on_holiday').length;
     if (!myTodayRecord) {
-      const own = companyRoster.find(r => String(r.user._id) === String(currentUser._id));
-      if (own && ['on_leave', 'on_holiday'].includes(own.status)) myTodayRecord = own;
+      if (isExecutive) {
+        const own = companyRoster.find(r => String(r.user._id) === String(currentUser._id));
+        if (own && ['on_leave', 'on_holiday', 'day_off'].includes(own.status)) myTodayRecord = own;
+      } else {
+        const exemptions = await dayExemptions(todayStr, [currentUser._id], rule);
+        const status = exemptions.leaveUsers.has(String(currentUser._id)) ? 'on_leave' : exemptions.holiday ? 'on_holiday' : !isWorkingDay(todayStr, rule) ? 'day_off' : null;
+        if (status) myTodayRecord = { status };
+      }
     }
     const todayDeductionTotal = todayRecords.reduce((sum, r) => sum + (r.deductionAmount || 0), 0);
-
-    // Department-scoped today attendance
-    const deptTodayRecords = todayRecords.filter((r) => r.user && r.user.department === userDept);
-    const deptCheckedInCount = deptTodayRecords.filter((r) => r.checkedIn).length;
-    const deptPresentCount = deptTodayRecords.filter((r) => r.status === 'present').length;
-    const deptLateCount = deptTodayRecords.filter((r) => r.isLate).length;
-    const deptAbsentCount = deptTodayRecords.filter((r) => r.status === 'absent' || (shiftEnded && r.status === 'not_checked_in')).length;
 
     // Company monthly deductions (only computed for CEO/Super Admin)
     let companyMonthlyDeductionsTotal = 0;
@@ -124,6 +124,7 @@ exports.getStats = async (req, res) => {
         date: { $regex: `^${currentMonthPrefix}` },
         deductionAmount: { $gt: 0 },
         isSimulated: { $ne: true },
+        'quarantine.at': { $exists: false },
       });
       companyMonthlyDeductionsTotal = monthRecords.reduce((sum, r) => sum + (r.deductionAmount || 0), 0);
     }
@@ -139,24 +140,6 @@ exports.getStats = async (req, res) => {
     const pendingLeavesCount = isExecutive
       ? await LeaveRequest.countDocuments({ status: 'pending' })
       : await LeaveRequest.countDocuments({ user: currentUser._id, status: 'pending' });
-
-    // 6. Department Squad Members live status
-    const squadMembers = (!isExecutive && userDept && userDept !== 'Executive')
-      ? deptUsers.map((u) => {
-          const rec = deptTodayRecords.find((r) => r.user?._id?.toString() === u._id.toString());
-          return {
-            _id: u._id,
-            name: u.name,
-            email: u.email,
-            role: u.role,
-            designation: u.designation,
-            phone: u.phone,
-            todayStatus: rec ? rec.status : 'not_checked_in',
-            checkIn: rec ? rec.checkIn : null,
-            isLate: rec ? rec.isLate : false,
-          };
-        })
-      : [];
 
     res.json({
       success: true,
@@ -192,6 +175,8 @@ exports.getStats = async (req, res) => {
         })),
       },
       attendance: {
+        myLeaveBalances,
+        ...(isExecutive ? {
         totalEmployees,
         checkedInToday: checkedInCount,
         presentCount,
@@ -203,13 +188,7 @@ exports.getStats = async (req, res) => {
         onHolidayCount,
         todayDeductions: todayDeductionTotal,
         monthlyDeductions: companyMonthlyDeductionsTotal,
-
-        // Department telemetry
-        deptTotalEmployees,
-        deptCheckedInToday: deptCheckedInCount,
-        deptPresentCount,
-        deptLateCount,
-        deptAbsentCount,
+        } : {}),
 
         // Personal telemetry
         myTodayStatus: myTodayRecord ? {
@@ -219,6 +198,9 @@ exports.getStats = async (req, res) => {
           minutesLate: myTodayRecord.minutesLate,
           deductionAmount: myTodayRecord.deductionAmount,
           deductionReason: myTodayRecord.deductionReason,
+          financialReviewRequired: myTodayRecord.financialReviewRequired,
+          override: myTodayRecord.override?.type ? { type: myTodayRecord.override.type } : null,
+          quarantine: myTodayRecord.quarantine?.at ? myTodayRecord.quarantine : null,
         } : null,
         myMonthlyPresentCount,
         myMonthlyLateCount,
@@ -226,7 +208,6 @@ exports.getStats = async (req, res) => {
       },
       upcomingDeadlines,
       pendingLeavesCount,
-      squadMembers,
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -237,7 +218,7 @@ exports.getStats = async (req, res) => {
 // @route   GET /api/dashboard/admin-notifications
 exports.getAdminNotifications = async (req, res) => {
   try {
-    const todayStr = getTodayString();
+    const todayStr = shiftDate(new Date(), await activeRule());
     const Task = require('../models/Task');
 
     // 1. Pending Leaves
@@ -272,6 +253,8 @@ exports.getAdminNotifications = async (req, res) => {
       date: todayStr,
       isLate: true,
       minutesLate: { $gte: 10 },
+      isSimulated: { $ne: true },
+      'quarantine.at': { $exists: false },
     })
       .populate('user', 'name email department designation')
       .sort({ minutesLate: -1 });

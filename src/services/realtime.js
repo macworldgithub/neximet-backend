@@ -1,6 +1,7 @@
 const { createServer } = require('node:http');
 const { Server } = require('socket.io');
 const jwt = require('jsonwebtoken');
+const { jwtSecret } = require('./authSecret');
 const mongoose = require('mongoose');
 const connectDB = require('../config/db');
 const User = require('../models/User');
@@ -74,7 +75,7 @@ function createRealtimeServer(app, { pollInterval = 1000 } = {}) {
     try {
       const token = socket.handshake.auth?.token;
       if (typeof token !== 'string') throw new Error('Sign in to connect to chat');
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'neximet_super_secret_jwt_key_2026_enterprise_portal');
+      const decoded = jwt.verify(token, jwtSecret());
       await connectDB();
       const user = await User.findById(decoded.id);
       if (!user?.isActive) throw new Error('User is inactive');

@@ -20,6 +20,12 @@ const attendanceSchema = new mongoose.Schema({
   scheduledCheckOut: Date,
   checkOutSource: { type: String, enum: ['employee', 'shift_end'] },
   isSimulated: { type: Boolean, default: false },
+  recordSource: { type: String, enum: ['employee', 'automatic', 'administrator'], default: 'employee' },
+  policySnapshot: mongoose.Schema.Types.Mixed,
+  wageSnapshot: Number,
+  expectedCheckIn: Date,
+  financialReviewRequired: { type: Boolean, default: false },
+  quarantine: { reason: String, at: Date },
   deviceLockKey: String,
   override: {
     type: { type: String, enum: ['absent', 'present'] },
@@ -28,7 +34,7 @@ const attendanceSchema = new mongoose.Schema({
     at: Date,
   },
   auditTrail: [{
-    action: { type: String, enum: ['mark_absent', 'mark_present', 'restore'] },
+    action: { type: String, enum: ['mark_absent', 'mark_present', 'restore', 'leave_adjustment', 'repeat_adjustment', 'repair'] },
     by: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     at: { type: Date, default: Date.now },
     reason: String,
@@ -42,7 +48,7 @@ const attendanceSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ['present', 'late', 'half_day', 'absent', 'on_leave'],
+    enum: ['present', 'late', 'half_day', 'absent', 'on_leave', 'on_holiday', 'day_off'],
     default: 'present',
   },
   isLate: {

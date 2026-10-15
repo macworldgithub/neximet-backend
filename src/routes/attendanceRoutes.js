@@ -9,6 +9,7 @@ const {
   markAbsent,
   markPresent,
   getPhoto,
+  repairRecord,
 } = require('../controllers/attendanceController');
 const { protect } = require('../middleware/auth');
 const { authorize } = require('../middleware/rbac');
@@ -21,6 +22,7 @@ router.post('/check-out', checkOut);
 router.get('/today', getTodayStatus);
 router.get('/history', getHistory);
 router.get('/records/:id/photo', getPhoto);
+router.post('/records/:id/repair', authorize('CEO', 'Super Admin'), repairRecord);
 router.get('/roster', authorize('CEO', 'Super Admin'), getDailyRoster);
 router.post('/mark-absent', authorize('CEO', 'Super Admin'), markAbsent);
 router.post('/mark-present', authorize('CEO', 'Super Admin'), markPresent);

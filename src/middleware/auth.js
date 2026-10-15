@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const { jwtSecret } = require('../services/authSecret');
 
 const protect = async (req, res, next) => {
   let token;
@@ -17,7 +18,7 @@ const protect = async (req, res, next) => {
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'neximet_super_secret_jwt_key_2026_enterprise_portal');
+    const decoded = jwt.verify(token, jwtSecret());
     req.user = await User.findById(decoded.id);
 
     if (!req.user || !req.user.isActive) {
@@ -26,6 +27,7 @@ const protect = async (req, res, next) => {
 
     next();
   } catch (err) {
+    if (err.status === 503) return res.status(503).json({ success: false, message: err.message });
     return res.status(401).json({ success: false, message: 'Token invalid or expired' });
   }
 };

@@ -5,7 +5,7 @@ const PushJob = require('../models/PushJob');
 const Message = require('../models/Message');
 const Conversation = require('../models/Conversation');
 const User = require('../models/User');
-const secret = () => process.env.JWT_SECRET || 'neximet_super_secret_jwt_key_2026_enterprise_portal';
+const { jwtSecret: secret } = require('./authSecret');
 const configured = () => !!(process.env.WEB_PUSH_VAPID_PUBLIC_KEY && process.env.WEB_PUSH_VAPID_PRIVATE_KEY && process.env.WEB_PUSH_SUBJECT);
 
 async function deliverJob(id) {

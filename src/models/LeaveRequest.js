@@ -24,6 +24,8 @@ const leaveRequestSchema = new mongoose.Schema({
     required: true,
     min: 0.5,
   },
+  session: { type: String, enum: ['full', 'morning', 'afternoon'], default: 'full' },
+  workingDates: [String],
   reason: {
     type: String,
     required: [true, 'Please provide reason for leave'],

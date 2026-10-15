@@ -3,6 +3,12 @@ const assert = require('node:assert/strict');
 const p = require('../src/services/attendancePolicy');
 const rule = p.normalizeRule();
 
+test('geofence distances stay finite for identical and antipodal GPS points', () => {
+  assert.equal(p.distanceMeters(24.8607, 67.0011, 24.8607, 67.0011), 0);
+  const antipode = p.distanceMeters(-88.40000000000009, 10, 88.40000000000009, -170);
+  assert.ok(Number.isFinite(antipode)); assert.ok(antipode > 20000000);
+});
+
 test('company dates and payroll month boundaries do not depend on server timezone', () => {
   for (const tz of ['UTC', 'America/Los_Angeles', 'Asia/Tokyo']) {
     const previous = process.env.TZ; process.env.TZ = tz;
@@ -48,6 +54,28 @@ test('invalid calendars, times and contradictory policy are rejected', () => {
     assert.throws(() => p.validateRule(p.normalizeRule(override)));
   }
 });
-test('truthy strings, malformed/oversized image data are not accepted as selfies', () => {
-  for (const photo of ['true', 'data:image/jpeg;base64,abcd', 'data:image/png;base64,' + 'A'.repeat(800000), {}, 'data:image/svg+xml;base64,AAAA']) assert.throws(() => p.validateSelfie(photo));
+test('truthy strings, malformed/oversized image data are not accepted as selfies', async () => {
+  for (const photo of ['true', 'data:image/jpeg;base64,abcd', 'data:image/png;base64,' + 'A'.repeat(800000), {}, 'data:image/svg+xml;base64,AAAA']) await assert.rejects(() => p.validateSelfie(photo));
+});
+
+test('approved morning/afternoon sessions adjust expected work and cap half-shift penalties', () => {
+  const { attendanceCalculation } = require('../src/services/leavePolicy');
+  const user = { _id: 'employee', dailyWage: 1000 }, day = '2026-10-13';
+  const exemptions = session => ({ holiday: null, leaveUsers: new Set(), halfDayUsers: new Map([['employee', session]]) });
+  const morning = attendanceCalculation(p.atCompanyTime(day, '13:00'), day, user, rule, exemptions('morning'));
+  assert.equal(morning.isLate, false); assert.equal(morning.deductionAmount, 0); assert.equal(morning.expectedCheckIn.getTime(), p.atCompanyTime(day, '13:30').getTime());
+  const afternoon = attendanceCalculation(p.atCompanyTime(day, '16:00'), day, user, rule, exemptions('afternoon'), 3);
+  assert.equal(afternoon.deductionAmount, 500); assert.equal(afternoon.scheduledCheckOut.getTime(), p.atCompanyTime(day, '13:30').getTime());
+});
+
+test('Monday–Friday calendar and working-day validation are explicit', () => {
+  assert.equal(p.isWorkingDay('2026-10-09', rule), true);
+  assert.equal(p.isWorkingDay('2026-10-10', rule), false);
+  for (const workingDays of [[], [1, 1], [7], ['1']]) assert.throws(() => p.validateRule(p.normalizeRule({ workingDays })));
+});
+
+test('legacy overnight schedules retain ordinary early-arrival hours when the saved policy is missing', () => {
+  const night = p.normalizeRule({ shiftStartTime: '22:00', shiftEndTime: '06:00' });
+  const record = { date: '2026-10-13', checkIn: p.atCompanyTime('2026-10-13', '21:00'), expectedCheckIn: p.atCompanyTime('2026-10-13', '22:00') };
+  assert.equal(p.recordedShift(record, night).totalWorkHours, 9);
 });
