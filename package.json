@@ -7,6 +7,7 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "test:chat": "node --test test/chat.test.js",
+    "test:mail": "node --test test/mail.test.js",
     "test:attendance": "node --test test/attendance-policy.test.js test/attendance.test.js",
     "seed": "node src/seed/seedRealUsers.js",
     "seed:legacy": "node src/seed/seedData.js"
@@ -17,10 +18,13 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "imapflow": "^2.5.2",
     "jsonwebtoken": "^9.0.2",
+    "mailparser": "^3.9.40",
     "mongoose": "^8.5.1",
     "morgan": "^1.10.0",
     "multer": "^1.4.5-lts.1",
+    "nodemailer": "^10.1.2",
     "sharp": "^0.35.5",
     "socket.io": "^4.8.4",
     "web-push": "^3.6.7"
