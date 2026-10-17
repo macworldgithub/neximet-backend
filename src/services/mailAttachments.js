@@ -26,6 +26,7 @@ async function attachmentPreviews(attachments = []) {
       size: attachment.size,
       contentType: attachment.contentType || 'application/octet-stream',
       inline: attachment.contentDisposition === 'inline' || !!attachment.related,
+      contentId: attachment.cid || attachment.contentId || '',
       isImage: raster || /^image\//i.test(attachment.contentType || ''),
     };
     if (raster && attempts++ < MAX_PREVIEWS && remainingBytes > 0) {

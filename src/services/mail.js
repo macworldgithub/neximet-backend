@@ -3,6 +3,7 @@ const nodemailer = require('nodemailer');
 const MailComposer = require('nodemailer/lib/mail-composer');
 const { simpleParser } = require('mailparser');
 const { attachmentPreviews } = require('./mailAttachments');
+const { formatMailBody, plainTextHtml } = require('./mailHtml');
 
 const MAX_MESSAGE_SIZE = 5 * 1024 * 1024;
 const fail = (message, status = 400) => { throw Object.assign(new Error(message), { status }); };
@@ -92,11 +93,12 @@ function createMailService({ ImapClient = ImapFlow, createTransport = nodemailer
         if (!message?.source) fail('Message not found.', 404);
         const parsed = await simpleParser(message.source, { skipHtmlToText: false, skipTextToHtml: true, skipImageLinks: true, maxHtmlLengthToParse: MAX_MESSAGE_SIZE });
         await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true });
-        return { ...summary(message), seen: true, cc: addresses(parsed.cc?.value), replyTo: addresses(parsed.replyTo?.value || parsed.from?.value), text: parsed.text || '', attachments: await attachmentPreviews(parsed.attachments) };
+        const body = formatMailBody(parsed, await attachmentPreviews(parsed.attachments));
+        return { ...summary(message), seen: true, cc: addresses(parsed.cc?.value), replyTo: addresses(parsed.replyTo?.value || parsed.from?.value), text: parsed.text || '', ...body };
       } finally { lock.release(); }
     }),
     async send(account, message) {
-      const raw = await new MailComposer({ ...message, from: { name: account.displayName, address: account.email }, disableFileAccess: true, disableUrlAccess: true }).compile().build();
+      const raw = await new MailComposer({ ...message, html: plainTextHtml(message.text), from: { name: account.displayName, address: account.email }, disableFileAccess: true, disableUrlAccess: true }).compile().build();
       const transport = smtp(account);
       let info;
       try { info = await transport.sendMail({ envelope: { from: account.email, to: [...message.to, ...message.cc] }, raw }); }

@@ -10,6 +10,7 @@ const User = require('../src/models/User');
 const sharp = require('sharp');
 const MailComposer = require('nodemailer/lib/mail-composer');
 const { attachmentPreviews } = require('../src/services/mailAttachments');
+const { formatMailBody, plainTextHtml } = require('../src/services/mailHtml');
 process.env.MAIL_ENCRYPTION_KEY = 'ab'.repeat(32);
 
 const draft = { to: 'recipient@example.com', cc: '', subject: 'Hello', text: 'A test message.' };
@@ -113,7 +114,7 @@ test('empty mailboxes avoid the IMAP 1:* range', async () => {
 test('reading uses stable UID validity, produces text, and explicitly marks read', async () => {
   const { service, calls } = fakeProvider();
   const result = await service.read(account, 'inbox', '42', '123');
-  assert.match(result.text, /Hello/); assert.equal(result.html, undefined); assert.equal(result.source, undefined); assert.equal(result.seen, true);
+  assert.match(result.text, /Hello/); assert.match(result.html, /Hello <b>Owner<\/b>/); assert.doesNotMatch(result.html, /<script/i); assert.equal(result.source, undefined); assert.equal(result.seen, true);
   assert.equal(calls.fetch.config.uid, true); assert.deepEqual(calls.flags[0], ['42', ['\\Seen'], { uid: true }]);
   await assert.rejects(service.read(account, 'inbox', '42', '999'), error => error.status === 409);
 });
@@ -142,7 +143,9 @@ test('reading multipart email includes visible previews for attachments and embe
   }
   assert.equal(result.attachments.find(item => item.filename === 'embedded.png').inline, true);
   assert.equal(result.attachments.find(item => item.filename === 'notes.pdf').preview, undefined);
-  assert.equal(result.html, undefined); assert.equal(result.source, undefined);
+  assert.match(result.html, /src="data:image\/webp;base64,/); assert.equal(result.hasRemoteImages, true); assert.equal(result.source, undefined);
+  assert.equal(result.attachments.find(item => item.filename === 'embedded.png').renderedInline, true);
+  assert.equal(result.attachments.find(item => item.filename === 'photo.png').renderedInline, false);
   assert.ok(!JSON.stringify(result.attachments).includes('https://tracking.example.com'));
   assert.equal(calls.flags.length, 1);
 });
@@ -184,6 +187,52 @@ test('complex photos get smaller previews and total preview bytes stay bounded',
     assert.ok(size <= 256 * 1024); total += size;
   }
   assert.ok(total <= 1024 * 1024);
+});
+
+test('HTML email retains sender formatting and quoted replies instead of generated greater-than markers', () => {
+  const html = '<style>.original{margin-bottom:24px;font-family:Arial}</style><div class="original" style="color:#111;font-size:16px"><p>Appreciate that, thanks Morgan</p><p>On Friday, Morgan wrote:</p><blockquote><p>Me again,</p><p>My brain hurts</p><ul><li>These messages will <strong>only continue</strong> if:</li></ul><a href="mailto:sender@example.com">Sender</a><table cellpadding="4"><tr><td>Original table</td></tr></table></blockquote></div>';
+  const result = formatMailBody({ html, text: 'Appreciate that\n> Me again,\n> My brain hurts' });
+  assert.match(result.html, /<blockquote>/); assert.match(result.html, /<strong>only continue<\/strong>/);
+  assert.match(result.html, /<style>\.original/); assert.match(result.html, /font-size:16px/); assert.match(result.html, /<table cellpadding="4">/);
+  assert.match(result.html, /href="mailto:sender@example.com"/); assert.match(result.html, /rel="noopener noreferrer"/);
+  assert.doesNotMatch(result.html, /&gt; Me again|&gt; My brain hurts/);
+});
+
+test('plain-text quote markers become nested visual quotes without changing real greater-than comparisons', () => {
+  const result = formatMailBody({ text: 'New reply\n\n> Earlier reply\n> > Oldest reply\n3 > 2 and <script>alert(1)</script>\n>\n> Back to earlier' });
+  assert.equal((result.html.match(/<blockquote/g) || []).length, 3);
+  assert.match(result.html, /3 &gt; 2 and &lt;script&gt;/);
+  assert.doesNotMatch(result.html, /&gt; Earlier|&gt; Oldest/);
+  assert.doesNotMatch(result.html, /<script>/);
+});
+
+test('email HTML removes active content, unsafe links and browser navigation directives', () => {
+  const html = '<meta http-equiv="refresh" content="0;url=https://evil.test"><base href="https://evil.test"><link rel="stylesheet" href="https://evil.test/style.css"><script>alert(document.cookie)</script><iframe srcdoc="bad">hidden</iframe><object data="bad">hidden</object><form action="https://evil.test"><input name="password"></form><svg onload="bad()"><script>bad()</script></svg><p onclick="bad()">Safe</p><a href="javascript:alert(1)" ping="https://evil.test" target="_top">Click</a><img src="data:image/svg+xml,<svg onload=bad()>"><img src="//evil.test/tracker"><img src="/api/auth/me">';
+  const result = formatMailBody({ html });
+  assert.match(result.html, /<p>Safe<\/p>/);
+  assert.doesNotMatch(result.html, /<(?:script|iframe|object|form|input|svg|base|meta|link)\b|\bonclick=|\bonload=|\bping=|javascript:|image\/svg|target="_top"/i);
+  assert.doesNotMatch(result.html, /<img/);
+});
+
+test('only valid attached CID previews are inserted at their original position', () => {
+  const attachments = [
+    { filename: 'logo.png', contentId: '<logo@example.test>', preview: { dataUrl: 'data:image/webp;base64,UklGRg==', width: 10, height: 10 } },
+    { filename: 'unused.png', contentId: 'unused', preview: { dataUrl: 'data:image/webp;base64,UklGRg==', width: 10, height: 10 } },
+    { filename: 'broken.png', contentId: 'broken' },
+  ];
+  const result = formatMailBody({ html: '<p>Before</p><img src="cid:logo%40example.test"><p>After</p><img src="cid:missing"><img src="cid:broken">' }, attachments);
+  assert.match(result.html, /Before<\/p><img src="data:image\/webp;base64,UklGRg==" \/><p>After/);
+  assert.equal(result.attachments[0].renderedInline, true); assert.equal(result.attachments[1].renderedInline, false); assert.equal(result.attachments[2].renderedInline, false);
+  assert.doesNotMatch(result.html, /cid:/);
+});
+
+test('sent plain-text replies also contain an HTML alternative with formatted quotes', async () => {
+  const { service, calls } = fakeProvider();
+  await service.send(account, validateMessage({ ...draft, text: 'Thanks\n\n> Earlier reply\n>> Older reply' }));
+  const parsed = await require('mailparser').simpleParser(calls.sent[0].raw);
+  assert.match(parsed.html, /<blockquote/); assert.doesNotMatch(parsed.html, /&gt; Earlier reply/);
+  assert.match(parsed.text, /> Earlier reply/);
+  assert.doesNotMatch(plainTextHtml('Hello <b>literal</b>'), /<b>/);
 });
 
 test('large and missing messages fail without marking read, releasing the mailbox', async () => {
