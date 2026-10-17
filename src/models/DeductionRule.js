@@ -2,6 +2,10 @@ const mongoose = require('mongoose');
 
 const deductionRuleSchema = new mongoose.Schema({
   policyKey: String,
+  policyVersion: String,
+  latePairThreshold: Number,
+  absenceCutoffTime: String,
+  salaryDivisor: Number,
   workingDays: { type: [Number], default: [1, 2, 3, 4, 5] },
   title: {
     type: String,

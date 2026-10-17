@@ -34,11 +34,54 @@ test('third monthly late triggers repeat penalty and never exceeds one day of pa
   assert.equal(p.calculateDeduction(30, 1000, { ...rule, consecutiveLateThreshold: 0 }, 10).deductionAmount, 50);
 });
 test('zero/unconfigured pay is respected and fixed penalties are bounded', () => {
-  assert.equal(p.dailyWage({ dailyWage: 0, baseSalary: 90000 }), 0);
-  assert.equal(p.dailyWage({ baseSalary: 30000 }), 1000);
+  assert.equal(p.dailyWage({ dailyWage: 0, baseSalary: 22000 }), 1000);
+  assert.equal(p.dailyWage({ baseSalary: 22000 }), 1000);
+  assert.equal(p.dailyWage({ baseSalary: null, dailyWage: 5000 }), 0);
   assert.equal(p.dailyWage({}), 0);
   assert.equal(p.calculateDeduction(30, 0, rule).deductionAmount, 0);
   assert.equal(p.calculateDeduction(30, 1000, { ...rule, deductionType: 'fixed', fixedDeductionAmount: 5000 }).deductionAmount, 1000);
+});
+
+test('company policy charges exactly one daily wage for each monthly late pair', () => {
+  const rule = p.companyRule();
+  assert.deepEqual(rule.workingDays, [1, 2, 3, 4, 5]);
+  for (let prior = 0; prior < 8; prior++) {
+    const result = p.calculateDeduction(90, 1000.25, rule, prior);
+    assert.equal(result.status, 'late'); assert.equal(result.isLate, true);
+    assert.equal(result.deductionAmount, prior % 2 === 1 ? 1000.25 : 0);
+  }
+  assert.equal(p.dailyWage({ baseSalary: 150000, dailyWage: 5000 }), 6818.18);
+  assert.equal(p.dailyWage({ baseSalary: 0, dailyWage: 5000 }), 0);
+});
+test('the company absence cutoff is strictly after 2 PM, independent of shift start', () => {
+  for (const start of ['09:00', '10:00', '11:00']) {
+    const rule = p.companyRule({ shiftStartTime: start });
+    const user = { baseSalary: 22000 };
+    for (const time of ['13:59:59', '14:00:00']) {
+      const result = p.calculateAttendance(`2026-10-19T${time}+05:00`, user, rule, 0);
+      assert.equal(result.status, 'late'); assert.equal(result.deductionAmount, 0);
+    }
+    const absent = p.calculateAttendance('2026-10-19T14:00:01+05:00', user, rule, 1);
+    assert.equal(absent.status, 'absent'); assert.equal(absent.isLate, false); assert.equal(absent.deductionAmount, 1000);
+  }
+});
+test('pair counts are monthly, policy-versioned, and exclude full-day absences and simulations', () => {
+  const query = p.lateCountFilter('employee', '2026-11-02', p.companyRule());
+  assert.equal(query.date.$gte, '2026-11-01'); assert.equal(query.date.$lt, '2026-11-02');
+  assert.equal(query.status, 'late'); assert.equal(query.isSimulated.$ne, true);
+  assert.equal(query['policySnapshot.policyVersion'], p.COMPANY_POLICY_VERSION);
+});
+test('salary visibility is CEO-only even in nested populated users, audits and deduction totals', () => {
+  const { payrollView } = require('../src/services/payrollPrivacy');
+  const payload = { user: { baseSalary: 22000, dailyWage: 999 }, auditTrail: [{ previousState: { wageSnapshot: 1000, deductionAmount: 1000 } }], totalDeductions: 1000, status: 'late' };
+  for (const role of ['Super Admin', 'Project Manager', 'Team Manager', 'Team Member']) {
+    const result = payrollView(payload, { role });
+    assert.equal(result.user.baseSalary, undefined); assert.equal(result.user.dailyWage, undefined);
+    assert.equal(result.auditTrail[0].previousState.wageSnapshot, undefined); assert.equal(result.totalDeductions, undefined);
+    assert.equal(result.status, 'late');
+  }
+  assert.equal(payrollView(payload, { role: 'CEO' }).user.dailyWage, 1000);
+  assert.equal(payload.user.dailyWage, 999);
 });
 test('overnight check-ins and scheduled ends belong to the shift start date', () => {
   const night = { ...rule, shiftStartTime: '22:00', shiftEndTime: '06:00' };
@@ -72,6 +115,15 @@ test('Monday–Friday calendar and working-day validation are explicit', () => {
   assert.equal(p.isWorkingDay('2026-10-09', rule), true);
   assert.equal(p.isWorkingDay('2026-10-10', rule), false);
   for (const workingDays of [[], [1, 1], [7], ['1']]) assert.throws(() => p.validateRule(p.normalizeRule({ workingDays })));
+});
+
+test('the new policy retains approved half-day coverage with currency precision', () => {
+  const { attendanceCalculation } = require('../src/services/leavePolicy');
+  const employee = { _id: 'employee', baseSalary: 150000 }, day = '2026-10-13';
+  const exemptions = { holiday: null, leaveUsers: new Set(), halfDayUsers: new Map([['employee', 'morning']]) };
+  const calculation = attendanceCalculation(p.atCompanyTime(day, '14:01'), day, employee, p.companyRule(), exemptions, 1);
+  assert.equal(calculation.status, 'absent'); assert.equal(calculation.isLate, false);
+  assert.equal(calculation.deductionAmount, 3409.09); assert.equal(calculation.deductionPercentage, 50);
 });
 
 test('legacy overnight schedules retain ordinary early-arrival hours when the saved policy is missing', () => {

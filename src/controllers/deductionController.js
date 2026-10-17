@@ -1,13 +1,12 @@
 const DeductionRule = require('../models/DeductionRule');
 const Attendance = require('../models/Attendance');
-const User = require('../models/User');
-const { TIME_ZONE, fail, shiftDate, validMonth, normalizeRule, validateRule, calculateDeduction } = require('../services/attendancePolicy');
+const { TIME_ZONE, fail, shiftDate, validMonth, normalizeRule, companyRule, validateRule, calculateDeduction } = require('../services/attendancePolicy');
 const { activeRule, closeEndedShifts } = require('../services/attendanceRecords');
 const { materializeHistory } = require('../services/attendanceHistory');
 const wrap = handler => async (req, res) => {
   try { await handler(req, res); } catch (error) { res.status(error.status || (error.code === 11000 || error.name === 'VersionError' ? 409 : error.name === 'ValidationError' ? 400 : 500)).json({ success: false, message: error.name === 'VersionError' ? 'Policy changed in another session. Reload before saving.' : error.message }); }
 };
-const fields = ['title','workingDays','shiftStartTime','shiftEndTime','gracePeriodMinutes','lateThresholdMinutes','deductionType','percentageDeductionRate','fixedDeductionAmount','halfDayThresholdMinutes','fullDayAbsentThresholdMinutes','consecutiveLateThreshold','consecutivePenaltyMultiplier','currencySymbol','officeLocation','antiProxySettings'];
+const fields = ['title','workingDays','shiftStartTime','shiftEndTime','gracePeriodMinutes','lateThresholdMinutes','deductionType','percentageDeductionRate','fixedDeductionAmount','halfDayThresholdMinutes','fullDayAbsentThresholdMinutes','consecutiveLateThreshold','consecutivePenaltyMultiplier','currencySymbol','officeLocation','antiProxySettings','policyVersion','latePairThreshold','absenceCutoffTime','salaryDivisor'];
 
 exports.getActiveRule = wrap(async (req, res) => {
   // A read must not create duplicate default policies during concurrent cold starts.
@@ -20,7 +19,7 @@ exports.updateRule = wrap(async (req, res) => {
   if (current && req.body.__v !== undefined && req.body.__v !== current.__v) fail('Policy changed in another session. Reload before saving.', 409);
   const changes = Object.fromEntries(fields.filter(key => req.body[key] !== undefined).map(key => [key, req.body[key]]));
   const previous = normalizeRule(current);
-  const rule = validateRule(normalizeRule({ ...previous, ...changes,
+  const rule = validateRule(companyRule({ ...previous, ...changes,
     officeLocation: { ...previous.officeLocation, ...changes.officeLocation }, antiProxySettings: { ...previous.antiProxySettings, ...changes.antiProxySettings } }));
   await DeductionRule.init();
   const document = current || await DeductionRule.findOneAndUpdate({ policyKey: 'attendance' }, { $setOnInsert: { policyKey: 'attendance', isActive: true } }, { upsert: true, new: true, runValidators: true });
@@ -31,9 +30,9 @@ exports.updateRule = wrap(async (req, res) => {
 });
 
 exports.simulateCalculation = wrap(async (req, res) => {
-  const minutes = req.body.minutesLate, wage = req.body.dailyWage, prior = req.body.priorLateCount ?? 0;
+  const minutes = req.body.minutesLate, wage = req.user.role === 'CEO' ? req.body.dailyWage : 0, prior = req.body.priorLateCount ?? 0;
   if (typeof minutes !== 'number' || !Number.isFinite(minutes) || minutes < 0 || minutes > 1440 || typeof wage !== 'number' || !Number.isFinite(wage) || wage < 0 || !Number.isInteger(prior) || prior < 0) fail('Provide valid minutes late (0–1440), non-negative wage and previous late count.');
-  const rule = validateRule(normalizeRule(req.body.ruleOverrides || await activeRule()));
+  const rule = validateRule(companyRule(req.body.ruleOverrides || await activeRule()));
   const result = calculateDeduction(minutes, wage, rule, prior);
   res.json({ success: true, simulation: { ...result, minutesLate: result.minutesLate, dailyWage: wage, deduction: result.deductionAmount, explanation: result.deductionReason } });
 });
@@ -42,13 +41,9 @@ exports.getMonthlyReport = wrap(async (req, res) => {
   const rule = await activeRule();
   const month = req.query.month || shiftDate(new Date(), rule).slice(0, 7);
   if (!validMonth(month)) fail('Month must be a valid YYYY-MM.');
-  const allowed = ['CEO','Super Admin','Project Manager'].includes(req.user.role);
+  const allowed = req.user.role === 'CEO';
   if (!allowed) fail('Access denied.', 403);
-  const filter = { date: { $regex: '^' + month }, $or: [{ deductionAmount: { $gt: 0 } }, { status: 'absent' }], isSimulated: { $ne: true }, 'quarantine.at': { $exists: false } };
-  if (req.user.role === 'Project Manager') {
-    const employees = await User.find({ department: req.user.department }).select('_id');
-    filter.user = { $in: employees.map(user => user._id) };
-  }
+  const filter = { date: { $regex: '^' + month }, $or: [{ deductionAmount: { $gt: 0 } }, { isLate: true }, { status: 'absent' }], isSimulated: { $ne: true }, 'quarantine.at': { $exists: false } };
   await closeEndedShifts(rule, filter.user ? { user: filter.user } : {});
   await materializeHistory(rule, filter);
   const records = await Attendance.find(filter).select('date user checkIn status isLate minutesLate deductionAmount deductionReason financialReviewRequired')

@@ -1,5 +1,7 @@
 // All attendance calendar calculations use the company's timezone, never the host's TZ.
 const TIME_ZONE = 'Asia/Karachi';
+const COMPANY_POLICY_VERSION = 'late_pairs_v1';
+const SALARY_DIVISOR = 22;
 const DEFAULT_RULE = {
   workingDays: [1, 2, 3, 4, 5],
   shiftStartTime: '09:00', shiftEndTime: '18:00', gracePeriodMinutes: 15,
@@ -70,6 +72,15 @@ function normalizeRule(input = {}) {
   const value = input.toObject ? input.toObject() : input;
   return { ...DEFAULT_RULE, ...value, officeLocation: { ...DEFAULT_RULE.officeLocation, ...value.officeLocation }, antiProxySettings: { ...DEFAULT_RULE.antiProxySettings, ...value.antiProxySettings } };
 }
+// Fixed company payroll rules supersede the old editable percentage tiers for
+// new attendance. normalizeRule remains available for recorded legacy snapshots.
+function companyRule(input = {}) {
+  return { ...normalizeRule(input), policyVersion: COMPANY_POLICY_VERSION, workingDays: [1, 2, 3, 4, 5], latePairThreshold: 2, absenceCutoffTime: '14:00', salaryDivisor: SALARY_DIVISOR };
+}
+function lateCountFilter(user, date, rule) {
+  return { user, date: { $gte: date.slice(0, 7) + '-01', $lt: date }, isLate: true, isSimulated: { $ne: true }, 'quarantine.at': { $exists: false },
+    ...(rule.policyVersion === COMPANY_POLICY_VERSION ? { status: 'late', 'policySnapshot.policyVersion': COMPANY_POLICY_VERSION } : {}) };
+}
 function validateRule(rule) {
   if (!Array.isArray(rule.workingDays) || !rule.workingDays.length || new Set(rule.workingDays).size !== rule.workingDays.length || rule.workingDays.some(day => !Number.isInteger(day) || day < 0 || day > 6)) fail('Working days must be distinct weekdays numbered 0–6.');
   timeMinutes(rule.shiftStartTime); timeMinutes(rule.shiftEndTime);
@@ -88,13 +99,26 @@ function validateRule(rule) {
   return rule;
 }
 function dailyWage(user) {
+  // An explicitly unassigned/zero salary must not fall back to an old manual rate.
+  if (user.baseSalary !== undefined) return user.baseSalary !== null && Number.isFinite(Number(user.baseSalary)) && Number(user.baseSalary) >= 0 ? Math.round(Number(user.baseSalary) / SALARY_DIVISOR * 100) / 100 : 0;
+  // Internal historical recalculations pass only their saved wage snapshot.
   if (user.dailyWage !== null && user.dailyWage !== undefined && Number.isFinite(Number(user.dailyWage)) && Number(user.dailyWage) >= 0) return Number(user.dailyWage);
-  if (user.baseSalary !== null && user.baseSalary !== undefined && Number.isFinite(Number(user.baseSalary)) && Number(user.baseSalary) >= 0) return Math.round(Number(user.baseSalary) / 30);
   return 0; // Unconfigured pay must never invent a financial deduction.
 }
-function calculateDeduction(minutes, wage, rule, priorLateCount = 0) {
+function calculateDeduction(minutes, wage, rule, priorLateCount = 0, context = {}) {
   const elapsed = Math.max(0, minutes);
   const minutesLate = Math.ceil(elapsed);
+  if (rule.policyVersion === COMPANY_POLICY_VERSION) {
+    const afterCutoff = context.afterCutoff ?? minutes > timeMinutes('14:00') - timeMinutes(rule.shiftStartTime);
+    const isLate = !afterCutoff && elapsed > rule.gracePeriodMinutes;
+    const pairComplete = isLate && (priorLateCount + 1) % 2 === 0;
+    const percentage = afterCutoff || pairComplete ? 100 : 0;
+    let reason = afterCutoff ? 'Arrival after 2:00 PM (Asia/Karachi): full-day absence; one daily wage deducted. This does not count as a late incident.'
+      : isLate ? `Monthly late arrival #${priorLateCount + 1}: ${pairComplete ? 'two late arrivals complete a pair; one daily wage deducted.' : 'first late of a pair; no deduction yet.'}`
+        : minutesLate ? `Within ${rule.gracePeriodMinutes} minute grace period.` : 'On time.';
+    if (!wage && percentage) reason += ' Salary is not configured; no monetary deduction applied.';
+    return { status: afterCutoff ? 'absent' : isLate ? 'late' : 'present', isLate, minutesLate, deductionAmount: Math.round(wage * percentage) / 100, deductionPercentage: percentage, deductionReason: reason };
+  }
   const isLate = elapsed > rule.gracePeriodMinutes;
   let status = 'present', percentage = 0, reason = minutesLate ? `Within ${rule.gracePeriodMinutes} minute grace period.` : 'On time.';
   if (isLate) {
@@ -109,7 +133,7 @@ function calculateDeduction(minutes, wage, rule, priorLateCount = 0) {
 }
 function calculateAttendance(date, user, rule, priorLateCount = 0) {
   const day = shiftDate(date, rule);
-  return calculateDeduction((new Date(date) - atCompanyTime(day, rule.shiftStartTime)) / 60000, dailyWage(user), rule, priorLateCount);
+  return calculateDeduction((new Date(date) - atCompanyTime(day, rule.shiftStartTime)) / 60000, dailyWage(user), rule, priorLateCount, { afterCutoff: new Date(date) > atCompanyTime(day, '14:00') });
 }
 function distanceMeters(lat1, lon1, lat2, lon2) {
   const rad = x => x * Math.PI / 180;
@@ -144,4 +168,4 @@ async function validateSelfie(photo) {
   } catch { fail('Selfie image could not be decoded. Capture a new photo.'); }
   return photo;
 }
-module.exports = { TIME_ZONE, DEFAULT_RULE, fail, companyDate, validDate, validMonth, addDays, isWorkingDay, shiftDate, scheduledEnd, recordedScheduleEnd, recordedShift, atCompanyTime, workHours, normalizeRule, validateRule, dailyWage, calculateDeduction, calculateAttendance, distanceMeters, validateSelfie };
+module.exports = { TIME_ZONE, COMPANY_POLICY_VERSION, SALARY_DIVISOR, DEFAULT_RULE, companyRule, lateCountFilter, fail, companyDate, validDate, validMonth, addDays, isWorkingDay, shiftDate, scheduledEnd, recordedScheduleEnd, recordedShift, atCompanyTime, workHours, normalizeRule, validateRule, dailyWage, calculateDeduction, calculateAttendance, distanceMeters, validateSelfie };

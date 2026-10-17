@@ -7,6 +7,7 @@ const { activeRule, closeEndedShifts, dayExemptions, dailyRoster, operationalOpe
 const { attendanceCalculation, attendanceSchedule } = require('../services/leavePolicy');
 const { materializeHistory } = require('../services/attendanceHistory');
 const { reconcileLeave, reconcileMonthlyLate } = require('../services/attendanceAdjustments');
+const { lateCountFilter } = require('../services/attendancePolicy');
 
 const executive = user => ['CEO', 'Super Admin'].includes(user.role);
 const wrap = handler => async (req, res) => {
@@ -85,7 +86,7 @@ exports.checkIn = wrap(async (req, res) => {
     if (current?.quarantine?.at) fail('Attendance requires administrator repair before clock actions can continue.', 409);
     if (current?.checkIn || current?.override?.type === 'absent' || (current?.status === 'absent' && current.recordSource !== 'automatic')) fail('Attendance was already recorded or overridden. Refresh before checking in.', 409);
     if (await Attendance.exists({ user: user._id, ...operationalOpen, date: { $ne: date } }).session(transaction)) fail('Close the previous open shift before checking in again.', 409);
-    const priorLateCount = await Attendance.countDocuments({ user: user._id, date: { $gte: date.slice(0, 7) + '-01', $lt: date }, isLate: true, isSimulated: { $ne: true }, 'quarantine.at': { $exists: false } }).session(transaction);
+    const priorLateCount = await Attendance.countDocuments(lateCountFilter(user._id, date, rule)).session(transaction);
     const exemptions = await dayExemptions(date, [user._id], rule, transaction);
     calculation = attendanceCalculation(checkIn, date, employee, rule, exemptions, priorLateCount);
     if (current?.override?.type === 'present') calculation = { ...calculation, status: 'present', isLate: false, minutesLate: 0, deductionAmount: 0, deductionPercentage: 0, deductionReason: current.deductionReason };
@@ -102,7 +103,7 @@ exports.checkIn = wrap(async (req, res) => {
   if (!record) fail('Attendance changed while checking in. Refresh and try again.', 409);
   await closeEndedShifts(rule, { user: user._id }, now);
   const saved = await Attendance.findById(record._id).select('-auditTrail -override.snapshot');
-  res.status(201).json({ success: true, message: (simulated ? 'CEO simulation recorded. ' : 'Check-in recorded. ') + (calculation.isLate ? calculation.minutesLate + ' minutes late.' : 'On time.'), attendance: saved, distanceFromOffice: location.distanceMeters });
+  res.status(201).json({ success: true, message: (simulated ? 'CEO simulation recorded. ' : 'Check-in recorded. ') + (calculation.status === 'absent' ? 'Arrival after 2 PM counted as a full-day absence.' : calculation.isLate ? calculation.minutesLate + ' minutes late.' : 'On time.'), attendance: saved, distanceFromOffice: location.distanceMeters });
 });
 
 exports.checkOut = wrap(async (req, res) => {
@@ -176,7 +177,7 @@ exports.getHistory = wrap(async (req, res) => {
   // from financial/incident totals, consistently with the payroll ledger.
   const countable = { $and: [{ $ne: ['$isSimulated', true] }, { $eq: [{ $ifNull: ['$quarantine.at', null] }, null] }] };
   const [records, summary] = await Promise.all([
-    Attendance.find(filter).select('-photo -auditTrail -override.snapshot').populate('user', 'name email department designation dailyWage').sort({ date: -1, _id: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+    Attendance.find(filter).select('-photo -auditTrail -override.snapshot').populate('user', 'name email department designation baseSalary dailyWage').sort({ date: -1, _id: -1 }).skip((page - 1) * limit).limit(limit).lean(),
     Attendance.aggregate([{ $match: aggregateFilter }, { $group: {
       _id: null, count: { $sum: 1 },
       lateCount: { $sum: { $cond: [{ $and: ['$isLate', countable] }, 1, 0] } },
@@ -265,7 +266,8 @@ async function overrideAttendance(req, res, absent) {
     if ((req.body.expectedRecordId !== undefined && (record ? String(record._id) : null) !== req.body.expectedRecordId) || (req.body.expectedVersion !== undefined && (record?.__v ?? null) !== req.body.expectedVersion)) fail('Attendance changed since you opened this action. Refresh and review it again.', 409);
     if (!record && !employedOn(targetUser, date)) fail('Cannot create attendance outside the employee\'s employment period.', 404);
     if (!targetUser.isActive && (!record || (targetUser.deactivatedAt && date > companyDate(targetUser.deactivatedAt)))) fail('Only recorded attendance before the employee left can be corrected.', 404);
-    rule = normalizeRule(record?.policySnapshot || await activeRule(transaction));
+    const currentRule = await activeRule(transaction);
+    rule = normalizeRule(record?.policySnapshot || (record ? { ...currentRule, policyVersion: undefined } : currentRule));
     const wage = record?.wageSnapshot ?? dailyWage(targetUser);
     const previousStatus = record?.status || 'not_checked_in';
     const previousState = record ? Object.fromEntries(['status','isLate','minutesLate','deductionAmount','deductionPercentage','deductionReason','notes','financialReviewRequired'].map(key => [key, record[key]])) : null;
@@ -275,7 +277,7 @@ async function overrideAttendance(req, res, absent) {
       const coverage = await dayExemptions(date, [userId], rule, transaction);
       const percentage = coverage.holiday || coverage.leaveUsers.has(String(userId)) || !isWorkingDay(date, rule) ? 0 : coverage.halfDayUsers.has(String(userId)) ? 50 : 100;
       const snapshot = record?.override?.type === 'absent' ? record.override.snapshot : Object.fromEntries(['status','isLate','minutesLate','deductionAmount','deductionPercentage','deductionReason','notes','override','financialReviewRequired'].map(key => [key, record ? record[key] : undefined]));
-      fields = { status: 'absent', isLate: false, minutesLate: 0, deductionAmount: Math.round(wage * percentage / 100), deductionPercentage: percentage, deductionReason: `${reason}${percentage < 100 ? ' Approved leave/day-off coverage limits this absence charge to ' + percentage + '% of daily wage.' : ''}`, notes: reason, financialReviewRequired: false,
+      fields = { status: 'absent', isLate: false, minutesLate: 0, deductionAmount: Math.round(wage * percentage) / 100, deductionPercentage: percentage, deductionReason: `${reason}${percentage < 100 ? ' Approved leave/day-off coverage limits this absence charge to ' + percentage + '% of daily wage.' : ''}`, notes: reason, financialReviewRequired: false,
         override: { type: 'absent', snapshot, by: req.user.id, at: new Date() } };
     } else {
       const snapshot = !req.body.verifyPresence && record?.override?.type === 'absent' ? record.override.snapshot : null;
@@ -288,7 +290,7 @@ async function overrideAttendance(req, res, absent) {
       ? await Attendance.findOneAndUpdate({ _id: record._id, __v: record.__v === undefined ? { $exists: false } : record.__v }, { $set: fields, $inc: { __v: 1 }, $push: { auditTrail: event } }, { new: true, runValidators: true, session: transaction }).select('-auditTrail -override.snapshot')
       : (await Attendance.create([{ user: userId, date, ...fields, recordSource: 'administrator', auditTrail: [event] }], { session: transaction }))[0];
     if (!saved) fail('Attendance changed concurrently. Refresh and try again.', 409);
-    if (record?.isLate && !fields.isLate) await reconcileMonthlyLate(userId, new Set([date.slice(0, 7)]), req.user.id, rule, transaction, `Administrator correction on ${date} removed an earlier monthly late incident.`);
+    if (record?.isLate !== fields.isLate) await reconcileMonthlyLate(userId, new Set([date.slice(0, 7)]), req.user.id, rule, transaction, `Administrator correction on ${date} changed a monthly late incident.`);
     return saved;
   });
   await closeEndedShifts(rule, { user: userId });

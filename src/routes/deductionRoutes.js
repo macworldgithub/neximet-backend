@@ -15,6 +15,6 @@ router.use((req, res, next) => { res.set('Cache-Control', 'private, no-store'); 
 router.get('/rules', getActiveRule);
 router.put('/rules', authorize('CEO'), updateRule);
 router.post('/simulate', simulateCalculation);
-router.get('/monthly-report', authorize('CEO', 'Super Admin', 'Project Manager'), getMonthlyReport);
+router.get('/monthly-report', authorize('CEO'), getMonthlyReport);
 
 module.exports = router;

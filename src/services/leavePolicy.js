@@ -45,10 +45,10 @@ function attendanceCalculation(checkIn, date, user, rule, exemptions, priorLateC
     return { ...schedule, status: 'present', isLate: false, minutesLate: 0, deductionAmount: 0, deductionPercentage: 0,
       deductionReason: exemptions.holiday ? 'Company holiday; no late penalty.' : exemptions.leaveUsers.has(key) ? 'Approved full-day leave; no late penalty.' : 'Scheduled day off; no late penalty.' };
   }
-  const calculation = calculateDeduction((new Date(checkIn) - schedule.expectedCheckIn) / 60000, dailyWage(user), rule, priorLateCount);
+  const calculation = calculateDeduction((new Date(checkIn) - schedule.expectedCheckIn) / 60000, dailyWage(user), rule, priorLateCount, { afterCutoff: new Date(checkIn) > atCompanyTime(date, '14:00') });
   if (halfSession) {
     calculation.deductionPercentage = Math.min(50, calculation.deductionPercentage);
-    calculation.deductionAmount = Math.min(Math.round(dailyWage(user) / 2), calculation.deductionAmount);
+    calculation.deductionAmount = Math.min(Math.round(dailyWage(user) * 50) / 100, calculation.deductionAmount);
     calculation.deductionReason += ` Approved ${halfSession} leave; arrival is assessed against the remaining half shift and its deduction is capped at half a daily wage.`;
   }
   return { ...schedule, ...calculation };

@@ -3,10 +3,10 @@ const DeductionRule = require('../models/DeductionRule');
 const User = require('../models/User');
 const Holiday = require('../models/Holiday');
 const LeaveRequest = require('../models/LeaveRequest');
-const { companyDate, normalizeRule, recordedShift, atCompanyTime, addDays, isWorkingDay } = require('./attendancePolicy');
+const { companyDate, companyRule, recordedShift, atCompanyTime, addDays, isWorkingDay } = require('./attendancePolicy');
 const { leaveCoverage } = require('./leavePolicy');
 
-async function activeRule(transaction) { return normalizeRule(await DeductionRule.findOne({ isActive: true }).sort({ updatedAt: -1 }).session(transaction || null)); }
+async function activeRule(transaction) { return companyRule(await DeductionRule.findOne({ isActive: true }).sort({ updatedAt: -1 }).session(transaction || null)); }
 const operationalOpen = { checkIn: { $ne: null }, checkOut: null, 'override.type': { $ne: 'absent' }, 'quarantine.at': { $exists: false } };
 const versionGuard = record => ({ __v: record.__v === undefined ? { $exists: false } : record.__v });
 
@@ -46,7 +46,7 @@ async function dayExemptions(date, userIds, rule, transaction) {
 
 async function dailyRoster(date = companyDate(), department) {
   const rule = await activeRule();
-  const candidates = await User.find({ $or: [{ isActive: true }, { deactivatedAt: { $gte: atCompanyTime(date, '00:00') } }], ...(department ? { department } : {}) }).select('name email role department designation dailyWage phone joinDate createdAt isActive deactivatedAt attendanceTrackingFrom employmentGaps').lean();
+  const candidates = await User.find({ $or: [{ isActive: true }, { deactivatedAt: { $gte: atCompanyTime(date, '00:00') } }], ...(department ? { department } : {}) }).select('name email role department designation baseSalary dailyWage phone joinDate createdAt isActive deactivatedAt attendanceTrackingFrom employmentGaps').lean();
   const users = candidates.filter(user => date >= companyDate(user.joinDate || user.createdAt) && (!user.attendanceTrackingFrom || date >= companyDate(user.attendanceTrackingFrom)) && !user.employmentGaps?.some(gap => date > companyDate(gap.start) && date < companyDate(gap.end)));
   const ids = users.map(user => user._id);
   const [records, exemptions, photos] = await Promise.all([

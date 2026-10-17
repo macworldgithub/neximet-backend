@@ -3,6 +3,12 @@ const User = require('../models/User');
 const mongoose = require('mongoose');
 const { jwtSecret } = require('../services/authSecret');
 const { fail } = require('../services/attendancePolicy');
+const { dailyWage: salaryDailyWage } = require('../services/attendancePolicy');
+const { protectPayroll } = require('../services/payrollPrivacy');
+function salaryPermissions(req) {
+  if (req.user.role !== 'CEO' && ['baseSalary', 'dailyWage', 'expectedPay'].some(key => req.body[key] !== undefined)) fail('Only the CEO can view or change employee compensation.', 403);
+  if (req.user.role !== 'CEO' && req.body.role === 'CEO') fail('Only the CEO can assign the CEO role.', 403);
+}
 const finiteAmount = (value, label, nullable = false) => {
   if (nullable && (value == null || value === '')) return null;
   if (!['number', 'string'].includes(typeof value) || (typeof value === 'string' && !value.trim()) || !Number.isFinite(Number(value)) || Number(value) < 0) fail(`${label} must be a finite, non-negative number.`);
@@ -42,6 +48,8 @@ exports.login = async (req, res) => {
     }
 
     const token = generateToken(user._id);
+    req.user = user;
+    protectPayroll(req, res);
 
     res.json({
       success: true,
@@ -112,6 +120,7 @@ exports.getAllUsers = async (req, res) => {
 // @route   POST /api/auth/users
 exports.createEmployee = async (req, res) => {
   try {
+    salaryPermissions(req);
     const {
       name,
       email,
@@ -150,7 +159,8 @@ exports.createEmployee = async (req, res) => {
     }
 
     const salary = finiteAmount(baseSalary, 'Base salary', true);
-    const wage = dailyWage == null || dailyWage === '' ? salary === null ? null : Math.round(salary / 30) : finiteAmount(dailyWage, 'Daily wage', true);
+    const wage = salary === null ? null : salaryDailyWage({ baseSalary: salary });
+    if (dailyWage != null && dailyWage !== '' && Math.abs(finiteAmount(dailyWage, 'Daily wage') - (wage || 0)) > 0.001) fail('Daily wage must equal base salary divided by 22.');
     const leaves = leaveBalances === undefined ? { casual: 10, sick: 8, annual: 14 } : balancesFrom(leaveBalances);
 
     const newUser = await User.create({
@@ -185,6 +195,7 @@ exports.createEmployee = async (req, res) => {
 // @route   PUT /api/auth/users/:id
 exports.updateUser = async (req, res) => {
   try {
+    salaryPermissions(req);
     const { id } = req.params;
     const updatedUser = await mongoose.connection.transaction(async transaction => {
       const user = await User.findOneAndUpdate({ _id: id }, { $inc: { attendanceVersion: 1 } }, { new: true, session: transaction }).select('+employmentGaps +attendanceTrackingFrom');
@@ -192,6 +203,7 @@ exports.updateUser = async (req, res) => {
       if (!user) {
         fail('Employee not found.', 404);
       }
+      if (req.user.role !== 'CEO' && user.role === 'CEO') fail('Only a CEO can modify a CEO account.', 403);
 
       const {
         name,
@@ -207,7 +219,7 @@ exports.updateUser = async (req, res) => {
       } = req.body;
 
       const snapshot = value => value === '' || value == null ? null : Number.isFinite(Number(value)) ? Number(value) : String(value);
-      for (const key of ['baseSalary', 'dailyWage']) if (req.body.expectedPay?.[key] !== undefined && snapshot(user[key]) !== snapshot(req.body.expectedPay[key])) fail('Employee pay changed since this form opened. Reload before saving.', 409);
+      for (const key of ['baseSalary', 'dailyWage']) if (req.body.expectedPay?.[key] !== undefined && snapshot(key === 'dailyWage' ? user.baseSalary == null ? null : salaryDailyWage(user) : user[key]) !== snapshot(req.body.expectedPay[key])) fail('Employee pay changed since this form opened. Reload before saving.', 409);
       for (const key of ['casual', 'sick', 'annual']) if (req.body.expectedLeaveBalances?.[key] !== undefined && snapshot(user.leaveBalances?.[key]) !== snapshot(req.body.expectedLeaveBalances[key])) fail('Leave balance changed since this form opened. Reload before saving.', 409);
 
       if (name) user.name = name.trim();
@@ -229,11 +241,9 @@ exports.updateUser = async (req, res) => {
         user.baseSalary = finiteAmount(baseSalary, 'Base salary', true);
       }
 
-      if (dailyWage !== undefined) {
-        user.dailyWage = finiteAmount(dailyWage, 'Daily wage', true);
-      } else if (baseSalary !== undefined && user.baseSalary !== null && user.dailyWage == null) {
-        user.dailyWage = Math.round(user.baseSalary / 30);
-      }
+      const derivedWage = user.baseSalary == null ? null : salaryDailyWage(user);
+      if (dailyWage != null && dailyWage !== '' && Math.abs(finiteAmount(dailyWage, 'Daily wage') - (derivedWage || 0)) > 0.001) fail('Daily wage must equal base salary divided by 22.');
+      user.dailyWage = derivedWage;
 
       if (leaveBalances !== undefined) user.leaveBalances = balancesFrom(leaveBalances, user.leaveBalances || { casual: 10, sick: 8, annual: 14 });
 
@@ -322,7 +332,8 @@ exports.resetCeoPassword = async (req, res) => {
       });
     }
 
-    const validKey = process.env.CEO_MASTER_KEY || 'NEXIMET-CEO-2026-RECOVERY';
+    const validKey = process.env.CEO_MASTER_KEY;
+    if (!validKey) return res.status(503).json({ success: false, message: 'CEO password recovery is not configured. Contact your system administrator.' });
     if (masterKey !== validKey) {
       return res.status(401).json({
         success: false,
@@ -357,6 +368,7 @@ exports.getPasswordResetRequests = async (req, res) => {
     const { status } = req.query;
     const filter = {
       'passwordResetRequest.status': status || 'Pending',
+      ...(req.user.role !== 'CEO' ? { role: { $ne: 'CEO' } } : {}),
     };
 
     const users = await User.find(filter)
@@ -425,6 +437,7 @@ exports.adminResetPassword = async (req, res) => {
         message: 'Employee not found.',
       });
     }
+    if (req.user.role !== 'CEO' && user.role === 'CEO') return res.status(403).json({ success: false, message: 'Only a CEO can reset another CEO account.' });
 
     user.password = newPassword;
     user.passwordResetRequest = {

@@ -1,5 +1,20 @@
 # Attendance fixes
 
+## Active payroll policy (October 2026)
+
+The following rules supersede the older percentage/fixed/repeat tiers for new attendance:
+
+- Every second late arrival in a calendar month deducts one daily wage. First, third, fifth, etc. late arrivals have no separate charge. Existing shift start and grace settings still define when lateness starts.
+- Arrival strictly after 14:00 in Asia/Karachi is a full-day absence with one daily wage deducted; it does not increment the late-pair count. Exactly 14:00 remains in the late window.
+- Daily wage is monthly base salary divided by 22, rounded to two decimal places. Manual daily-wage overrides are rejected. Saturday and Sunday are off; approved leave and mandatory holiday exemptions still apply.
+- Previously recorded financial evidence retains its saved policy/wage. New records use `late_pairs_v1`; late pairs reset by calendar month and exclude legacy records, simulations and quarantined evidence. Attendance corrections and approved leave reconcile later pairs transactionally.
+- Only the CEO receives salary, daily-wage or deduction amounts from login and authenticated APIs, including populated users and audit snapshots. Other roles retain attendance status access. Only CEOs can set pay, assign the CEO role, modify CEO accounts or reset CEO passwords.
+- CEO recovery requires a configured private `CEO_MASTER_KEY`; the built-in recovery fallback has been removed.
+
+Validation: `npm run test:attendance` in backend; `npm run test:attendance` and `npm run test:payroll:ui` in frontend. Browser tests use the installed Playwright Chromium, or the executable supplied through `AI_TEST_BROWSER`.
+
+The notes below describe the previous implementation and other attendance fixes.
+
 Attendance calculations now use Asia/Karachi and the configured shift. Overnight attendance belongs to the shift's start date, including overrides, simulations and default payroll-month selection.
 
 Implemented corrections:

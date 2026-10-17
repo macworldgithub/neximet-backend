@@ -18,6 +18,9 @@ const p = require('../src/services/attendancePolicy');
 process.env.JWT_SECRET = 'isolated-attendance-test-secret';
 let mongo, directory, server, base, people, photo, bootstrap;
 const testTempRoot = path.resolve(process.env.ATTENDANCE_TEST_TMPDIR || os.tmpdir());
+// Freeze calendar constructors for attendance, while retaining the real clock
+// for MongoDB heartbeat/session expiry and JWT expiry across date jumps.
+const actualNow = Date.now;
 const token = new Map();
 async function request(user, endpoint, body, method = body ? 'POST' : 'GET') {
   const res = await fetch(base + endpoint, { method, headers: { ...(user ? { Authorization: 'Bearer ' + token.get(String(user._id)) } : {}), ...(body ? { 'Content-Type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
@@ -55,7 +58,7 @@ before(async () => {
     { name: 'CEO', role: 'CEO', department: 'Executive' },
     { name: 'Admin', role: 'Super Admin', department: 'Executive' },
     { name: 'Manager', role: 'Project Manager', department: 'Software Development' },
-  ].map((person, i) => ({ ...person, email: `attendance${i}@example.test`, password: 'isolated-password', dailyWage: 1000 })));
+  ].map((person, i) => ({ ...person, email: `attendance${i}@example.test`, password: 'isolated-password', baseSalary: 22000, dailyWage: 1000 })));
   for (const user of people) token.set(String(user._id), jwt.sign({ id: user._id }, process.env.JWT_SECRET));
   photo = 'data:image/png;base64,' + (await readFile(path.join(__dirname, 'fixtures', 'attendance-image.png'))).toString('base64');
   const app = express(); app.use(express.json({ limit: '1mb' }));
@@ -67,10 +70,12 @@ before(async () => {
   server = app.listen(0, '127.0.0.1'); await new Promise(resolve => server.once('listening', resolve));
   base = 'http://127.0.0.1:' + server.address().port;
 });
-beforeEach(async () => {
+beforeEach(async t => {
+  t.mock.timers.reset(); t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime('2026-10-15', '12:00').getTime() });
+  Date.now = actualNow;
   await Promise.all([Attendance.deleteMany({}), DeductionRule.deleteMany({}), Holiday.deleteMany({}), LeaveRequest.deleteMany({})]);
   await DeductionRule.create({ ...p.DEFAULT_RULE, policyKey: 'attendance', shiftStartTime: '00:00', shiftEndTime: '23:59' });
-  await User.updateMany({}, { $set: { joinDate: new Date(), isActive: true, dailyWage: 1000, 'leaveBalances.casual': 10 }, $unset: { deactivatedAt: '', attendanceCalendarThrough: '', attendanceCalendarRevision: '', attendanceTrackingFrom: '', employmentGaps: '' } });
+  await User.updateMany({}, { $set: { joinDate: new Date(), isActive: true, baseSalary: 22000, dailyWage: 1000, 'leaveBalances.casual': 10 }, $unset: { deactivatedAt: '', attendanceCalendarThrough: '', attendanceCalendarRevision: '', attendanceTrackingFrom: '', employmentGaps: '' } });
 });
 after(async () => {
   if (server) await new Promise(resolve => server.close(resolve));
@@ -78,6 +83,82 @@ after(async () => {
   if (bootstrap) await bootstrap.close();
   if (mongo && mongo.exitCode === null) { const exited = new Promise(resolve => mongo.once('exit', resolve)); mongo.kill(); await exited; }
   if (directory && path.dirname(path.resolve(directory)) === testTempRoot && path.basename(directory).startsWith('neximet-attendance-test-')) await rm(directory, { recursive: true, force: true });
+});
+
+test('real arrivals charge every second monthly late and separately charge arrivals strictly after 2 PM', async t => {
+  await User.updateOne({ _id: people[0]._id }, { $set: { joinDate: p.atCompanyTime('2026-09-01', '00:00'), baseSalary: 150000, dailyWage: 5 } });
+  await DeductionRule.updateOne({}, { $set: { shiftStartTime: '09:00', shiftEndTime: '18:00' } });
+  const cases = [
+    ['2026-10-05', '13:59', 'late', true, 0],
+    ['2026-10-06', '14:00', 'late', true, 6818.18],
+    ['2026-10-07', '14:01', 'absent', false, 6818.18],
+    ['2026-10-08', '09:16', 'late', true, 0],
+    ['2026-10-09', '10:00', 'late', true, 6818.18],
+    ['2026-11-02', '10:00', 'late', true, 0],
+  ];
+  for (const [day, time, status, isLate, amount] of cases) {
+    t.mock.timers.setTime(p.atCompanyTime(day, time).getTime());
+    const response = await request(people[0], '/attendance/check-in', payload());
+    assert.equal(response.status, 201, response.body.message);
+    assert.equal(response.body.attendance.status, status, day);
+    assert.equal(response.body.attendance.isLate, isLate, day);
+    assert.equal(response.body.attendance.deductionAmount, undefined);
+    const saved = await Attendance.findOne({ user: people[0]._id, date: day });
+    assert.equal(saved.deductionAmount, amount, day); assert.equal(saved.wageSnapshot, 6818.18);
+    assert.equal(saved.policySnapshot.policyVersion, p.COMPANY_POLICY_VERSION);
+  }
+  const ledger = await request(people[2], '/deductions/monthly-report?month=2026-10');
+  const employee = ledger.body.report.find(row => row.user._id === people[0].id);
+  assert.equal(employee.totalLateIncidents, 4); assert.equal(employee.totalDeductions, 20454.54);
+  // Removing/restoring an earlier late reassigns the pair charge to the correct later date.
+  assert.equal((await request(people[3], '/attendance/mark-absent', { userId: people[0].id, date: '2026-10-05' })).status, 200);
+  for (const [day, amount] of [['2026-10-06', 0], ['2026-10-08', 6818.18], ['2026-10-09', 0]]) assert.equal((await Attendance.findOne({ user: people[0]._id, date: day })).deductionAmount, amount, day);
+  assert.equal((await request(people[3], '/attendance/mark-present', { userId: people[0].id, date: '2026-10-05' })).status, 200);
+  for (const [day, amount] of [['2026-10-05', 0], ['2026-10-06', 6818.18], ['2026-10-08', 0], ['2026-10-09', 6818.18]]) assert.equal((await Attendance.findOne({ user: people[0]._id, date: day })).deductionAmount, amount, day);
+});
+
+test('salary, daily wages, audit deductions and pay snapshots are CEO-only across authenticated responses and login', async () => {
+  await record(people[0], { wageSnapshot: 1000, override: { type: 'absent', snapshot: { deductionAmount: 123 } }, auditTrail: [{ action: 'mark_absent', by: people[2]._id, previousState: { deductionAmount: 123, wageSnapshot: 1000 } }] });
+  function noPay(value) {
+    if (!value || typeof value !== 'object') return;
+    for (const [key, item] of Object.entries(value)) {
+      assert.ok(!['baseSalary', 'dailyWage', 'deductionAmount', 'wageSnapshot', 'totalDeductions', 'monthlyDeductions', 'myMonthlyDeductions', 'todayDeductions'].includes(key), key);
+      noPay(item);
+    }
+  }
+  for (const person of [people[0], people[3], people[4]]) {
+    for (const endpoint of ['/auth/me', '/auth/users', '/attendance/today', '/attendance/history', '/dashboard/stats', ...(person.role === 'Super Admin' ? ['/attendance/roster'] : [])]) {
+      const response = await request(person, endpoint); assert.equal(response.status, 200, endpoint); noPay(response.body);
+      assert.equal(response.headers.get('cache-control'), 'private, no-store');
+    }
+    const login = await request(null, '/auth/login', { email: person.email, password: 'isolated-password' });
+    assert.equal(login.status, 200); noPay(login.body);
+  }
+  await User.updateOne({ _id: people[0]._id }, { $set: { baseSalary: 150000, dailyWage: 99 } });
+  const ceo = await request(people[2], '/auth/users');
+  const employee = ceo.body.users.find(user => user._id === people[0].id);
+  assert.equal(employee.baseSalary, 150000); assert.equal(employee.dailyWage, 6818.18);
+  const history = await request(people[2], '/attendance/history');
+  assert.equal(history.body.records[0].deductionAmount, 50); assert.equal(history.body.records[0].user.dailyWage, 6818.18);
+});
+
+test('Super Admins retain profile management but cannot set pay, promote CEOs or take over CEO accounts', async () => {
+  for (const body of [{ baseSalary: 44000 }, { dailyWage: 2000 }, { expectedPay: { baseSalary: 22000 } }, { role: 'CEO' }]) assert.equal((await request(people[3], `/auth/users/${people[0].id}`, body, 'PUT')).status, 403);
+  assert.equal((await request(people[3], `/auth/users/${people[2].id}`, { name: 'Takeover' }, 'PUT')).status, 403);
+  assert.equal((await request(people[3], '/auth/admin-reset-password', { userId: people[2].id, newPassword: 'blocked-password' })).status, 403);
+  const profile = await request(people[3], `/auth/users/${people[0].id}`, { phone: '123' }, 'PUT');
+  assert.equal(profile.status, 200); assert.equal(profile.body.user.baseSalary, undefined);
+  const creation = { name: 'New Employee', email: 'new-payroll@example.test', password: 'isolated-password', department: 'Software Development' };
+  assert.equal((await request(people[3], '/auth/users', { ...creation, baseSalary: 44000 })).status, 403);
+  assert.equal((await request(people[3], '/auth/users', { ...creation, role: 'CEO' })).status, 403);
+  const created = await request(people[3], '/auth/users', creation); assert.equal(created.status, 201); assert.equal(created.body.user.baseSalary, undefined);
+  await User.deleteOne({ _id: created.body.user._id });
+  const changed = await request(people[2], `/auth/users/${people[0].id}`, { baseSalary: 44000 }, 'PUT');
+  assert.equal(changed.status, 200); assert.equal(changed.body.user.dailyWage, 2000);
+  assert.equal((await request(people[2], `/auth/users/${people[0].id}`, { dailyWage: 2100 }, 'PUT')).status, 400);
+  const previous = process.env.CEO_MASTER_KEY; delete process.env.CEO_MASTER_KEY;
+  try { assert.equal((await request(null, '/auth/ceo-reset-password', { email: people[2].email, masterKey: 'NEXIMET-CEO-2026-RECOVERY', newPassword: 'blocked-password' })).status, 503); }
+  finally { if (previous === undefined) delete process.env.CEO_MASTER_KEY; else process.env.CEO_MASTER_KEY = previous; }
 });
 
 test('unauthenticated and employee simulation/administrative requests are denied', async () => {
@@ -92,12 +173,12 @@ test('check-in rejects missing device, fake photos and invalid/outside coordinat
   assert.equal(await Attendance.countDocuments(), 0);
 });
 test('real check-in uses server timestamp and respects duplicate user/day under concurrency', async () => {
-  const start = Date.now();
+  const start = new Date().getTime();
   const results = await Promise.all([request(people[0], '/attendance/check-in', payload()), request(people[0], '/attendance/check-in', payload())]);
   assert.equal(results.filter(res => res.status === 201).length, 1);
   assert.equal(results.filter(res => res.status === 409).length, 1);
   const doc = await Attendance.findOne({ user: people[0]._id });
-  assert.ok(doc.checkIn.getTime() >= start && doc.checkIn.getTime() <= Date.now());
+  assert.ok(doc.checkIn.getTime() >= start && doc.checkIn.getTime() <= new Date().getTime());
   assert.equal(doc.location.isVerified, true);
   assert.equal(await Attendance.countDocuments(), 1);
 });
@@ -140,7 +221,7 @@ test('checkout is atomic and cannot be overwritten by repeated clicks', async ()
   const second = await Attendance.findById(first._id); assert.equal(second.checkOut.getTime(), first.checkOut.getTime());
 });
 test('future simulated check-in cannot yield negative worked hours', async () => {
-  await record(people[0], { checkIn: new Date(Date.now() + 3600000) });
+  await record(people[0], { checkIn: new Date(new Date().getTime() + 3600000) });
   assert.equal((await request(people[0], '/attendance/check-out', {})).status, 400);
   assert.equal((await Attendance.findOne()).checkOut, undefined);
 });
@@ -152,7 +233,7 @@ test('overdue shifts close at their recorded scheduled end, including prior-day 
   assert.equal(closed.totalWorkHours, 9); assert.equal(closed.checkOutSource, 'shift_end'); assert.equal(closed.checkOut.getTime(), p.atCompanyTime(day, '18:00').getTime());
 });
 test('malformed legacy dates cannot break roster reads or be silently rewritten', async () => {
-  const inserted = await Attendance.collection.insertOne({ user: people[1]._id, date: 'legacy-invalid-date', checkIn: new Date(Date.now() - 60000), checkOut: null, status: 'present' });
+  const inserted = await Attendance.collection.insertOne({ user: people[1]._id, date: 'legacy-invalid-date', checkIn: new Date(new Date().getTime() - 60000), checkOut: null, status: 'present' });
   const roster = await request(people[3], '/attendance/roster'); assert.equal(roster.status, 200);
   const legacy = await Attendance.collection.findOne({ _id: inserted.insertedId }); assert.equal(legacy.checkOut, null); assert.equal(legacy.date, 'legacy-invalid-date');
 });
@@ -187,8 +268,8 @@ test('repeated absence overrides preserve original state and manual presence is 
 });
 test('CEO simulated penalties do not affect real monthly payroll or employee dashboard counts', async () => {
   await record(people[2], { isSimulated: true, deductionAmount: 500 });
-  const ledger = await request(people[3], '/deductions/monthly-report'); assert.equal(ledger.body.grandTotalDeductions, 0);
-  const dashboard = await request(people[3], '/dashboard/stats'); assert.equal(dashboard.body.attendance.totalEmployees, 4); assert.equal(dashboard.body.attendance.checkedInToday, 0); assert.equal(dashboard.body.attendance.monthlyDeductions, 0);
+  const ledger = await request(people[2], '/deductions/monthly-report'); assert.equal(ledger.body.grandTotalDeductions, 0);
+  const dashboard = await request(people[3], '/dashboard/stats'); assert.equal(dashboard.body.attendance.totalEmployees, 4); assert.equal(dashboard.body.attendance.checkedInToday, 0); assert.equal(dashboard.body.attendance.monthlyDeductions, undefined);
 });
 test('full-day late absence retains check-in evidence without counting as present attendance', async () => {
   await record(people[0], { status: 'absent', deductionAmount: 1000, deductionPercentage: 100, minutesLate: 180 });
@@ -213,7 +294,7 @@ test('department history filters before pagination, summary covers every matchin
   await Attendance.insertMany(Array.from({ length: 110 }, (_, i) => ({ user: people[1]._id, date: p.addDays(today, -i), status: 'present' })));
   await record(people[0], { date: p.addDays(today, -200), checkOut: new Date(), deductionAmount: 75 });
   const filtered = await request(people[3], '/attendance/history?department=Software%20Development');
-  assert.equal(filtered.status, 200); assert.equal(filtered.body.count, 1); assert.equal(filtered.body.records.length, 1); assert.equal(filtered.body.totalDeductions, 75);
+  assert.equal(filtered.status, 200); assert.equal(filtered.body.count, 1); assert.equal(filtered.body.records.length, 1); assert.equal(filtered.body.totalDeductions, undefined);
   const all = await request(people[3], '/attendance/history?limit=10'); assert.equal(all.body.count, 111); assert.equal(all.body.pages, 12);
   const self = await request(people[0], '/attendance/history?userId=' + people[1].id); assert.equal(self.body.count, 1); assert.equal(self.body.records[0].photo, undefined); assert.equal(self.body.records[0].hasPhoto, true);
   for (const query of ['?month=2026-13','?page=0','?limit=1000','?status=wrong']) assert.equal((await request(people[3], '/attendance/history' + query)).status, 400);
@@ -270,14 +351,15 @@ test('approved full-day leave and holidays are not counted as unexplained absenc
   assert.equal(roster.body.roster.find(r => r.user._id === people[1].id).status, 'on_holiday');
   const dashboard = await request(people[3], '/dashboard/stats'); assert.equal(dashboard.status, 200); assert.equal(dashboard.body.attendance.absentCount, 0); assert.equal(dashboard.body.attendance.totalEmployees, 4);
   const workedOnHoliday = await request(people[1], '/attendance/check-in', payload('holiday-device'));
-  assert.equal(workedOnHoliday.status, 201); assert.equal(workedOnHoliday.body.attendance.deductionAmount, 0); assert.equal(workedOnHoliday.body.attendance.isLate, false);
+  assert.equal(workedOnHoliday.status, 201); assert.equal(workedOnHoliday.body.attendance.deductionAmount, undefined); assert.equal(workedOnHoliday.body.attendance.isLate, false);
 });
-test('monthly ledger includes admin access, scopes managers, and does not call absence a late incident', async () => {
+test('monthly ledger is CEO-only and does not call absence a late incident', async () => {
   await record(people[0], { status: 'absent', isLate: false, minutesLate: 0, deductionAmount: 1000 });
   await record(people[1], { deductionAmount: 75 });
-  const admin = await request(people[3], '/deductions/monthly-report'); assert.equal(admin.status, 200); assert.equal(admin.body.grandTotalDeductions, 1075);
-  const manager = await request(people[4], '/deductions/monthly-report'); assert.equal(manager.body.report.length, 1); assert.equal(manager.body.report[0].totalLateIncidents, 0); assert.equal(manager.body.report[0].totalAbsentIncidents, 1);
-  assert.equal((await request(people[3], '/deductions/monthly-report?month=wrong')).status, 400);
+  const admin = await request(people[2], '/deductions/monthly-report'); assert.equal(admin.status, 200); assert.equal(admin.body.grandTotalDeductions, 1075);
+  for (const person of [people[0], people[3], people[4]]) assert.equal((await request(person, '/deductions/monthly-report')).status, 403);
+  const absence = admin.body.report.find(row => row.user._id === people[0].id); assert.equal(absence.totalLateIncidents, 0); assert.equal(absence.totalAbsentIncidents, 1);
+  assert.equal((await request(people[2], '/deductions/monthly-report?month=wrong')).status, 400);
 });
 
 test('dashboards retain personal and executive attendance without returning squad attendance', async () => {
@@ -289,11 +371,11 @@ test('dashboards retain personal and executive attendance without returning squa
     assert.equal(response.body.squadMembers, undefined);
     assert.ok(!Object.keys(response.body.attendance).some(key => key.startsWith('dept')));
     if (person.id === people[0].id || person.id === people[4].id) {
-      assert.equal(response.body.attendance.myMonthlyDeductions, person.id === people[0].id ? 75 : 100);
+      assert.equal(response.body.attendance.myMonthlyDeductions, undefined);
       assert.ok(response.body.attendance.myTodayStatus.checkIn);
     } else {
       assert.equal(response.body.attendance.checkedInToday, 2);
-      assert.equal(response.body.attendance.monthlyDeductions, 175);
+      assert.equal(response.body.attendance.monthlyDeductions, person.role === 'CEO' ? 175 : undefined);
     }
   }
 });
@@ -301,7 +383,7 @@ test('saved policy and simulator share validated full-day/repeat calculations an
   const invalid = await request(people[2], '/deductions/rules', { gracePeriodMinutes: 70, halfDayThresholdMinutes: 60 }, 'PUT'); assert.equal(invalid.status, 400);
   assert.equal((await request(people[0], '/deductions/rules', { gracePeriodMinutes: 10 }, 'PUT')).status, 403);
   const saved = await request(people[2], '/deductions/rules', { officeLocation: { radiusMeters: 400 } }, 'PUT'); assert.equal(saved.status, 200); assert.equal(saved.body.rule.officeLocation.latitude, 24.8607);
-  const simulated = await request(people[0], '/deductions/simulate', { minutesLate: 180, dailyWage: 1000, priorLateCount: 2 }); assert.equal(simulated.body.simulation.deduction, 1000); assert.equal(simulated.body.simulation.status, 'absent');
+  const simulated = await request(people[2], '/deductions/simulate', { minutesLate: 841, dailyWage: 1000, priorLateCount: 2 }); assert.equal(simulated.body.simulation.deduction, 1000); assert.equal(simulated.body.simulation.status, 'absent');
   assert.equal((await request(people[0], '/deductions/simulate', { minutesLate: -1, dailyWage: 1000 })).status, 400);
   await DeductionRule.deleteMany({});
   await Promise.all([request(people[0], '/deductions/rules'), request(people[1], '/deductions/rules')]); assert.equal(await DeductionRule.countDocuments(), 0);
@@ -426,7 +508,7 @@ test('invalid legacy shift ends are quarantined instead of blocking subsequent a
 test('today exposes an earlier open shift after an overnight-to-daytime policy change', async () => {
   const OriginalDate = Date, day = p.companyDate(), previousDay = p.addDays(day, -1), now = p.atCompanyTime(day, '02:00').getTime();
   const open = await record(people[0], { date: previousDay, checkIn: p.atCompanyTime(previousDay, '22:00'), scheduledCheckOut: p.atCompanyTime(day, '06:00') });
-  global.Date = class extends OriginalDate { constructor(...args) { super(...(args.length ? args : [now])); } static now() { return now; } };
+  global.Date = class extends OriginalDate { constructor(...args) { super(...(args.length ? args : [now])); } };
   try { const today = await request(people[0], '/attendance/today'); assert.equal(today.body.attendance, null); assert.equal(today.body.openAttendance._id, open.id); assert.equal(today.body.openAttendance.date, previousDay); assert.equal((await request(people[0], '/attendance/check-out', {})).status, 200); }
   finally { global.Date = OriginalDate; }
 });
@@ -509,7 +591,7 @@ test('administrator overrides serialize with full and half leave approvals, incl
 
 test('absence review uses saved wage/calendar and refuses new rows before joining or in employment gaps', async () => {
   const day = p.companyDate(), original = await record(people[0], { policySnapshot: { ...p.DEFAULT_RULE, workingDays: [0,1,2,3,4,5,6] }, wageSnapshot: 1000 });
-  await User.updateOne({ _id: people[0]._id }, { $set: { dailyWage: 2000 } });
+  await User.updateOne({ _id: people[0]._id }, { $set: { baseSalary: 44000, dailyWage: 2000 } });
   await DeductionRule.updateOne({}, { $set: { workingDays: [0] } });
   const result = await request(people[2], '/attendance/mark-absent', { userId: people[0].id, date: day });
   assert.equal(result.status, 200); assert.equal(result.body.attendance.deductionAmount, 1000);
@@ -541,7 +623,7 @@ test('morning leave credits only the working half after approval, automatic clos
   assert.equal((await Attendance.findById(open._id)).totalWorkHours, 4.5);
   const checkout = await record(people[4], { date: day, checkIn: p.atCompanyTime(day, '09:00'), expectedCheckIn: p.atCompanyTime(day, '13:30'), scheduledCheckOut: p.atCompanyTime(day, '18:00'), policySnapshot: p.DEFAULT_RULE });
   const OriginalDate = Date, now = p.atCompanyTime(day, '16:00').getTime();
-  global.Date = class extends OriginalDate { constructor(...args) { super(...(args.length ? args : [now])); } static now() { return now; } };
+  global.Date = class extends OriginalDate { constructor(...args) { super(...(args.length ? args : [now])); } };
   try { const result = await request(people[4], '/attendance/check-out', {}); assert.equal(result.status, 200); assert.equal(result.body.attendance.totalWorkHours, 2.5); }
   finally { global.Date = OriginalDate; }
   assert.equal((await Attendance.findById(checkout._id)).checkIn.getTime(), checkout.checkIn.getTime());
@@ -577,7 +659,7 @@ test('afternoon leave no-show appears when the remaining morning half ends', asy
 });
 
 test('direct checkout quarantines an invalid legacy schedule without inventing departure evidence', async () => {
-  const day = p.companyDate(), inserted = await Attendance.collection.insertOne({ user: people[0]._id, date: day, checkIn: new Date(Date.now() - 60000), checkOut: null, scheduledCheckOut: 'invalid-end', status: 'present' });
+  const day = p.companyDate(), inserted = await Attendance.collection.insertOne({ user: people[0]._id, date: day, checkIn: new Date(new Date().getTime() - 60000), checkOut: null, scheduledCheckOut: 'invalid-end', status: 'present' });
   const result = await request(people[0], '/attendance/check-out', {}); assert.equal(result.status, 409);
   const raw = await Attendance.collection.findOne({ _id: inserted.insertedId }); assert.equal(raw.checkOut, null); assert.equal(raw.scheduledCheckOut, 'invalid-end'); assert.ok(raw.quarantine.at);
 });
@@ -588,9 +670,11 @@ test('today exposes the remaining half-shift before check-in and distinguishes s
   assert.equal((await approve(await apply(people[0], day, day, 'morning'))).status, 200);
   const result = await request(people[0], '/attendance/today');
   assert.equal(result.status, 200); assert.equal(result.body.personalSchedule.halfDaySession, 'morning'); assert.equal(new Date(result.body.personalSchedule.expectedCheckIn).getTime(), p.atCompanyTime(day, '13:30').getTime());
-  const otherWeekday = (new Date(day + 'T00:00:00Z').getUTCDay() + 1) % 7;
-  await DeductionRule.updateOne({}, { $set: { workingDays: [otherWeekday] } });
-  assert.equal((await request(people[1], '/attendance/today')).body.attendance.status, 'day_off');
+  await DeductionRule.updateOne({}, { $set: { workingDays: [0, 6] } });
+  assert.deepEqual((await request(people[1], '/deductions/rules')).body.rule.workingDays, [1,2,3,4,5]);
+  const OriginalDate = Date, saturday = p.atCompanyTime('2026-10-17', '12:00').getTime();
+  global.Date = class extends OriginalDate { constructor(...args) { super(...(args.length ? args : [saturday])); } };
+  try { assert.equal((await request(people[1], '/attendance/today')).body.attendance.status, 'day_off'); } finally { global.Date = OriginalDate; }
 });
 
 test('a real arrival upgrades an inferred no-show in place without bypassing an administrator absence', async () => {
@@ -626,13 +710,13 @@ test('repair restores the canonical browser/day lock and rolls back conflicting 
 
 test('stale quarantine writes cannot undo repairs during automatic closure or direct checkout', async () => {
   for (const [index, explicit] of [false, true].entries()) {
-    const person = people[index], inserted = await Attendance.collection.insertOne({ user: person._id, date: p.companyDate(), checkIn: new Date(Date.now() - 60000), checkOut: null, scheduledCheckOut: 'invalid-end', status: 'present', __v: 0 });
+    const person = people[index], inserted = await Attendance.collection.insertOne({ user: person._id, date: p.companyDate(), checkIn: new Date(new Date().getTime() - 60000), checkOut: null, scheduledCheckOut: 'invalid-end', status: 'present', __v: 0 });
     const original = Attendance.collection.updateOne;
     let repaired = false;
     Attendance.collection.updateOne = async function (filter, update, ...args) {
       if (String(filter._id) === String(inserted.insertedId) && update.$set?.quarantine && !repaired) {
         repaired = true;
-        await original.call(this, { _id: inserted.insertedId }, { $set: { scheduledCheckOut: new Date(Date.now() + 3600000) }, $inc: { __v: 1 } });
+        await original.call(this, { _id: inserted.insertedId }, { $set: { scheduledCheckOut: new Date(new Date().getTime() + 3600000) }, $inc: { __v: 1 } });
       }
       return original.call(this, filter, update, ...args);
     };
@@ -729,7 +813,7 @@ test('missing scheduled ends use saved overnight policy for automatic and explic
   const two = await record(people[1], { date: previous, checkIn: p.atCompanyTime(previous, '22:00'), scheduledCheckOut: null, policySnapshot: night });
   await DeductionRule.updateOne({}, { $set: { shiftStartTime: '09:00', shiftEndTime: '18:00' } });
   const OriginalDate = Date, now = p.atCompanyTime(day, '02:00').getTime();
-  global.Date = class extends OriginalDate { constructor(...args) { super(...(args.length ? args : [now])); } static now() { return now; } };
+  global.Date = class extends OriginalDate { constructor(...args) { super(...(args.length ? args : [now])); } };
   try {
     const today = await request(people[0], '/attendance/today'); assert.equal(today.status, 200); assert.equal(today.body.openAttendance?._id, one.id); assert.equal(new Date(today.body.openAttendance.scheduledCheckOut).getTime(), p.atCompanyTime(day, '06:00').getTime()); assert.equal((await Attendance.findById(one._id)).checkOut, undefined); assert.equal((await Attendance.findById(one._id)).scheduledCheckOut, null);
     const checkout = await request(people[1], '/attendance/check-out', {}); assert.equal(checkout.status, 200); assert.equal(checkout.body.attendance.totalWorkHours, 4); assert.equal(new Date(checkout.body.attendance.checkOut).getTime(), now);
@@ -765,7 +849,7 @@ test('non-finite compensation is rejected and explicit zero pay remains zero', a
   await User.deleteOne({ _id: zero.body.user._id });
   await User.updateOne({ _id: people[0]._id }, { $set: { baseSalary: 150000, dailyWage: 0 } });
   const unrelated = await request(people[2], `/auth/users/${people[0].id}`, { phone: '+92 000 0000000' }, 'PUT');
-  assert.equal(unrelated.status, 200); assert.equal(unrelated.body.user.dailyWage, 0);
+  assert.equal(unrelated.status, 200); assert.equal(unrelated.body.user.dailyWage, 6818.18);
 });
 
 test('attendance authorization fails closed when JWT_SECRET is missing', async () => {
@@ -784,7 +868,7 @@ test('employee dashboards never disclose company attendance or wage deductions a
   for (const person of [people[0], people[4]]) {
     const result = await request(person, '/dashboard/stats'); assert.equal(result.status, 200);
     for (const key of ['totalEmployees','checkedInToday','presentCount','lateCount','absentCount','todayDeductions','monthlyDeductions']) assert.equal(result.body.attendance[key], undefined, key);
-    if (person.id === people[0].id) { assert.equal(result.body.attendance.myMonthlyDeductions, 50); assert.equal(result.body.attendance.myLeaveBalances.casual, 9); }
+    if (person.id === people[0].id) { assert.equal(result.body.attendance.myMonthlyDeductions, undefined); assert.equal(result.body.attendance.myLeaveBalances.casual, 9); }
   }
   const executive = await request(people[2], '/dashboard/stats'); assert.equal(executive.body.attendance.todayDeductions, 125); assert.equal(executive.body.attendance.totalEmployees, 4);
 });
@@ -833,23 +917,25 @@ test('date repair cannot report success while corrupt expected arrival still req
 });
 
 test('today materializes an overdue no-show without requiring a history or dashboard visit', async t => {
-  t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime(p.companyDate(), '12:00').getTime() });
+  t.mock.timers.reset(); t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime('2026-10-15', '12:00').getTime() });
+  Date.now = actualNow;
   await DeductionRule.updateOne({}, { $set: { workingDays: [0, 1, 2, 3, 4, 5, 6], shiftEndTime: '00:01' } });
   const response = await request(people[0], '/attendance/today');
   assert.equal(response.status, 200);
   assert.equal(response.body.attendance?.status, 'absent');
   assert.equal(response.body.attendance.financialReviewRequired, true);
-  assert.equal(response.body.attendance.deductionAmount, 0);
+  assert.equal(response.body.attendance.deductionAmount, undefined);
   assert.equal(await Attendance.countDocuments({ user: people[1]._id }), 0);
 });
 
 test('automatic no-shows retain the wage at generation when pay changes before review', async t => {
-  t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime(p.companyDate(), '12:00').getTime() });
+  t.mock.timers.reset(); t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime('2026-10-15', '12:00').getTime() });
+  Date.now = actualNow;
   const day = p.companyDate();
   await DeductionRule.updateOne({}, { $set: { workingDays: [0, 1, 2, 3, 4, 5, 6], shiftEndTime: '00:01' } });
   await request(people[3], '/attendance/roster');
-  await User.updateOne({ _id: people[0]._id }, { $set: { dailyWage: 2000 } });
-  const response = await request(people[3], '/attendance/mark-absent', { userId: people[0].id, date: day });
+  await User.updateOne({ _id: people[0]._id }, { $set: { baseSalary: 44000, dailyWage: 2000 } });
+  const response = await request(people[2], '/attendance/mark-absent', { userId: people[0].id, date: day });
   assert.equal(response.status, 200);
   assert.equal(response.body.attendance.wageSnapshot, 1000);
   assert.equal(response.body.attendance.deductionAmount, 1000);
@@ -859,46 +945,49 @@ test('quarantined evidence remains visible but does not count as payable deducti
   await record(people[0], { quarantine: { at: new Date(), reason: 'Needs review' }, deductionAmount: 500 });
   const personal = (await request(people[0], '/dashboard/stats')).body.attendance;
   assert.ok(personal.myTodayStatus.quarantine.at);
-  assert.equal(personal.myMonthlyDeductions, 0);
+  assert.equal(personal.myMonthlyDeductions, undefined);
   assert.equal(personal.myMonthlyPresentCount, 0);
   assert.equal(personal.myMonthlyLateCount, 0);
-  const company = (await request(people[3], '/dashboard/stats')).body.attendance;
+  const company = (await request(people[2], '/dashboard/stats')).body.attendance;
   assert.equal(company.checkedInToday, 0);
   assert.equal(company.lateCount, 0);
   assert.equal(company.todayDeductions, 0);
   assert.equal(company.monthlyDeductions, 0);
-  assert.equal((await request(people[3], '/deductions/monthly-report')).body.grandTotalDeductions, 0);
+  assert.equal((await request(people[2], '/deductions/monthly-report')).body.grandTotalDeductions, 0);
   const history = (await request(people[0], '/attendance/history')).body;
-  assert.equal(history.records[0].deductionAmount, 500);
-  assert.equal(history.totalDeductions, 0);
+  assert.equal(history.records[0].deductionAmount, undefined);
+  assert.equal(history.totalDeductions, undefined);
   assert.equal(history.lateCount, 0);
 });
 
 test('quarantined late incidents cannot increase a later real arrival repeat penalty', async t => {
-  t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime('2026-10-15', '12:00').getTime() });
+  t.mock.timers.reset(); t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime('2026-10-15', '12:00').getTime() });
+  Date.now = actualNow;
   const day = p.companyDate();
   await User.updateOne({ _id: people[0]._id }, { $set: { joinDate: p.atCompanyTime(p.addDays(day, -3), '00:00') } });
   for (const offset of [-2, -1]) await record(people[0], { date: p.addDays(day, offset), checkOut: new Date(), quarantine: { at: new Date(), reason: 'Needs review' } });
   await DeductionRule.updateOne({}, { $set: { workingDays: [0, 1, 2, 3, 4, 5, 6], fullDayAbsentThresholdMinutes: 1440, halfDayThresholdMinutes: 1439, gracePeriodMinutes: 0 } });
   const response = await request(people[0], '/attendance/check-in', payload());
   assert.equal(response.status, 201);
-  assert.equal(response.body.attendance.deductionAmount, 50);
+  assert.equal((await Attendance.findOne({ user: people[0]._id, date: day })).deductionAmount, 0);
 });
 
 test('simulated late incidents cannot increase a later real arrival repeat penalty', async t => {
-  t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime('2026-10-15', '12:00').getTime() });
+  t.mock.timers.reset(); t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime('2026-10-15', '12:00').getTime() });
+  Date.now = actualNow;
   const day = p.companyDate();
   await User.updateOne({ _id: people[2]._id }, { $set: { joinDate: p.atCompanyTime(p.addDays(day, -3), '00:00') } });
   for (const offset of [-2, -1]) await record(people[2], { date: p.addDays(day, offset), checkOut: new Date(), isSimulated: true });
   await DeductionRule.updateOne({}, { $set: { workingDays: [0, 1, 2, 3, 4, 5, 6], fullDayAbsentThresholdMinutes: 1440, halfDayThresholdMinutes: 1439, gracePeriodMinutes: 0 } });
   const response = await request(people[2], '/attendance/check-in', payload());
   assert.equal(response.status, 201);
-  assert.equal(response.body.attendance.deductionAmount, 50);
+  assert.equal(response.body.attendance.deductionAmount, 0);
   assert.equal(response.body.attendance.isSimulated, false);
 });
 
 test('overnight administrative alerts use the working day and exclude simulations/quarantined evidence', async t => {
-  t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime('2026-11-01', '02:00').getTime() });
+  t.mock.timers.reset(); t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime('2026-11-01', '02:00').getTime() });
+  Date.now = actualNow;
   await DeductionRule.updateOne({}, { $set: { shiftStartTime: '22:00', shiftEndTime: '06:00' } });
   const fields = { date: '2026-10-31', checkIn: p.atCompanyTime('2026-10-31', '22:35'), scheduledCheckOut: p.atCompanyTime('2026-11-01', '06:00') };
   const real = await record(people[0], fields);
@@ -911,7 +1000,8 @@ test('overnight administrative alerts use the working day and exclude simulation
 });
 
 test('legacy early overnight arrival retains worked hours in explicit and automatic checkout', async t => {
-  t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime('2026-10-14', '02:00').getTime() });
+  t.mock.timers.reset(); t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime('2026-10-14', '02:00').getTime() });
+  Date.now = actualNow;
   await DeductionRule.updateOne({}, { $set: { shiftStartTime: '22:00', shiftEndTime: '06:00' } });
   const fields = { date: '2026-10-13', checkIn: p.atCompanyTime('2026-10-13', '21:00'), expectedCheckIn: p.atCompanyTime('2026-10-13', '22:00'), scheduledCheckOut: null };
   await record(people[0], fields);
@@ -925,7 +1015,8 @@ test('legacy early overnight arrival retains worked hours in explicit and automa
 });
 
 test('a narrow overnight history query cannot infer absence over next-morning quarantined arrival evidence', async t => {
-  t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime('2026-10-15', '12:00').getTime() });
+  t.mock.timers.reset(); t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime('2026-10-15', '12:00').getTime() });
+  Date.now = actualNow;
   await DeductionRule.updateOne({}, { $set: { shiftStartTime: '22:00', shiftEndTime: '06:00' } });
   await User.updateOne({ _id: people[0]._id }, { $set: { joinDate: p.atCompanyTime('2026-10-13', '00:00') } });
   const legacy = await Attendance.collection.insertOne({ user: people[0]._id, date: 'unknown-day', checkIn: p.atCompanyTime('2026-10-14', '02:00'), status: 'late', quarantine: { at: new Date(), reason: 'Invalid working date' } });
@@ -936,7 +1027,8 @@ test('a narrow overnight history query cannot infer absence over next-morning qu
 });
 
 test('repairing a working date reopens the completed calendar checkpoint so its vacated date is not lost', async t => {
-  t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime('2026-10-15', '12:00').getTime() });
+  t.mock.timers.reset(); t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime('2026-10-15', '12:00').getTime() });
+  Date.now = actualNow;
   await User.updateOne({ _id: people[0]._id }, { $set: { joinDate: p.atCompanyTime('2026-10-12', '00:00') } });
   const row = await record(people[0], { date: '2026-10-13', checkIn: p.atCompanyTime('2026-10-12', '09:00'), scheduledCheckOut: p.atCompanyTime('2026-10-12', '18:00'), quarantine: { at: new Date(), reason: 'Wrong working date' } });
   const range = '/attendance/history?startDate=2026-10-12&endDate=2026-10-13';
@@ -957,7 +1049,8 @@ test('working-date repair rejects a stale confirmation and preserves the newer q
 });
 
 test('a calendar scan finishing after a concurrent repair cannot reinstate its stale checkpoint', async t => {
-  t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime('2026-10-15', '12:00').getTime() });
+  t.mock.timers.reset(); t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime('2026-10-15', '12:00').getTime() });
+  Date.now = actualNow;
   await User.updateOne({ _id: people[0]._id }, { $set: { joinDate: p.atCompanyTime('2026-10-12', '00:00') } });
   const row = await record(people[0], { date: '2026-10-13', checkIn: p.atCompanyTime('2026-10-12', '09:00'), scheduledCheckOut: p.atCompanyTime('2026-10-12', '18:00'), quarantine: { at: new Date(), reason: 'Wrong date' } });
   const original = User.updateOne;
@@ -983,7 +1076,8 @@ test('a calendar scan finishing after a concurrent repair cannot reinstate its s
 });
 
 test('working-date repair aligns derived schedule bounds and hours while retaining original arrival/departure evidence', async t => {
-  t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime('2026-10-15', '12:00').getTime() });
+  t.mock.timers.reset(); t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime('2026-10-15', '12:00').getTime() });
+  Date.now = actualNow;
   for (const [index, closed] of [false, true].entries()) {
     const row = await record(people[index], { date: '2026-10-14', checkIn: p.atCompanyTime('2026-10-13', '09:00'), expectedCheckIn: p.atCompanyTime('2026-10-14', '09:00'), scheduledCheckOut: p.atCompanyTime('2026-10-14', '18:00'), ...(closed ? { checkOut: p.atCompanyTime('2026-10-13', '17:00'), totalWorkHours: 0 } : {}), policySnapshot: p.DEFAULT_RULE, quarantine: { at: new Date(), reason: 'Wrong date' } });
     const response = await request(people[3], `/attendance/records/${row.id}/repair`, { date: '2026-10-13' });
