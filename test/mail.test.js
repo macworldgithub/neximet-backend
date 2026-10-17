@@ -7,6 +7,9 @@ const { createMailService, validateMessage } = require('../src/services/mail');
 const { createMailHandlers } = require('../src/controllers/mailController');
 const MailAccount = require('../src/models/MailAccount');
 const User = require('../src/models/User');
+const sharp = require('sharp');
+const MailComposer = require('nodemailer/lib/mail-composer');
+const { attachmentPreviews } = require('../src/services/mailAttachments');
 process.env.MAIL_ENCRYPTION_KEY = 'ab'.repeat(32);
 
 const draft = { to: 'recipient@example.com', cc: '', subject: 'Hello', text: 'A test message.' };
@@ -113,6 +116,74 @@ test('reading uses stable UID validity, produces text, and explicitly marks read
   assert.match(result.text, /Hello/); assert.equal(result.html, undefined); assert.equal(result.source, undefined); assert.equal(result.seen, true);
   assert.equal(calls.fetch.config.uid, true); assert.deepEqual(calls.flags[0], ['42', ['\\Seen'], { uid: true }]);
   await assert.rejects(service.read(account, 'inbox', '42', '999'), error => error.status === 409);
+});
+
+test('reading multipart email includes visible previews for attachments and embedded CID images', async () => {
+  const png = await sharp({ create: { width: 32, height: 24, channels: 3, background: '#5470f4' } }).png().toBuffer();
+  const source = await new MailComposer({
+    from: 'sender@example.com', to: account.email, subject: 'Images',
+    html: '<p>See the photo</p><img src="cid:embedded-photo"><img src="https://tracking.example.com/pixel">',
+    attachments: [
+      { filename: 'photo.png', content: png, contentType: 'image/png' },
+      { filename: 'embedded.png', content: png, contentType: 'image/png', cid: 'embedded-photo' },
+      { filename: 'notes.pdf', content: Buffer.from('%PDF-test'), contentType: 'application/pdf' },
+    ],
+  }).compile().build();
+  const { service, calls } = fakeProvider({ rows: [{ uid: 42, size: source.length, source, flags: new Set() }] });
+  const result = await service.read(account, 'inbox', '42', '123');
+  assert.equal(result.attachments.length, 3);
+  for (const filename of ['photo.png', 'embedded.png']) {
+    const item = result.attachments.find(attachment => attachment.filename === filename);
+    assert.equal(item.isImage, true);
+    assert.match(item.preview.dataUrl, /^data:image\/webp;base64,/);
+    const decoded = await sharp(Buffer.from(item.preview.dataUrl.split(',')[1], 'base64')).metadata();
+    assert.equal(decoded.format, 'webp'); assert.equal(decoded.width, 32); assert.equal(decoded.height, 24);
+    assert.equal(item.content, undefined);
+  }
+  assert.equal(result.attachments.find(item => item.filename === 'embedded.png').inline, true);
+  assert.equal(result.attachments.find(item => item.filename === 'notes.pdf').preview, undefined);
+  assert.equal(result.html, undefined); assert.equal(result.source, undefined);
+  assert.ok(!JSON.stringify(result.attachments).includes('https://tracking.example.com'));
+  assert.equal(calls.flags.length, 1);
+});
+
+test('previews orient and resize photos and do not trust attachment MIME types', async () => {
+  const jpeg = await sharp({ create: { width: 1800, height: 900, channels: 3, background: '#123456' } }).jpeg().withMetadata({ orientation: 6 }).toBuffer();
+  const [result] = await attachmentPreviews([{ filename: 'photo.bin', contentType: 'application/octet-stream', size: jpeg.length, content: jpeg }]);
+  assert.equal(result.isImage, true); assert.equal(result.preview.width, 600); assert.equal(result.preview.height, 1200);
+  const decoded = await sharp(Buffer.from(result.preview.dataUrl.split(',')[1], 'base64')).metadata();
+  assert.equal(decoded.orientation, undefined); assert.equal(decoded.exif, undefined);
+});
+
+test('corrupt images and SVG disguised as PNG do not prevent viewing other attachments', async () => {
+  const png = await sharp({ create: { width: 8, height: 8, channels: 3, background: '#ffffff' } }).png().toBuffer();
+  const result = await attachmentPreviews([
+    { filename: 'evil.png', contentType: 'image/png', content: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>') },
+    { filename: 'broken.png', contentType: 'image/png', content: Buffer.from('89504e470d0a1a0a0000000000000000', 'hex') },
+    { filename: 'real.png', contentType: 'image/png', size: png.length, content: png },
+  ]);
+  assert.equal(result[0].preview, undefined); assert.equal(result[1].preview, undefined);
+  assert.ok(result[2].preview); assert.ok(!JSON.stringify(result).includes('<script>'));
+});
+
+test('image preview work is bounded for emails with many image parts', async () => {
+  const png = await sharp({ create: { width: 2, height: 2, channels: 3, background: '#ffffff' } }).png().toBuffer();
+  const result = await attachmentPreviews(Array.from({ length: 22 }, (_, index) => ({ filename: `${index}.png`, content: png, size: png.length, contentType: 'image/png' })));
+  assert.equal(result.length, 22); assert.equal(result.filter(item => item.preview).length, 20);
+  assert.equal(result[20].isImage, true); assert.equal(result[20].preview, undefined);
+});
+
+test('complex photos get smaller previews and total preview bytes stay bounded', async () => {
+  const png = await sharp(require('node:crypto').randomBytes(1200 * 1200 * 3), { raw: { width: 1200, height: 1200, channels: 3 } }).png().toBuffer();
+  const attachments = Array.from({ length: 6 }, (_, index) => ({ filename: `photo${index}.png`, content: png, size: png.length, contentType: 'image/png' }));
+  const result = await attachmentPreviews(attachments);
+  assert.ok(result[0].preview); assert.equal(result[0].preview.width, 600);
+  let total = 0;
+  for (const item of result) if (item.preview) {
+    const size = Buffer.from(item.preview.dataUrl.split(',')[1], 'base64').length;
+    assert.ok(size <= 256 * 1024); total += size;
+  }
+  assert.ok(total <= 1024 * 1024);
 });
 
 test('large and missing messages fail without marking read, releasing the mailbox', async () => {

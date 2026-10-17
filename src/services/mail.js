@@ -2,6 +2,7 @@ const { ImapFlow } = require('imapflow');
 const nodemailer = require('nodemailer');
 const MailComposer = require('nodemailer/lib/mail-composer');
 const { simpleParser } = require('mailparser');
+const { attachmentPreviews } = require('./mailAttachments');
 
 const MAX_MESSAGE_SIZE = 5 * 1024 * 1024;
 const fail = (message, status = 400) => { throw Object.assign(new Error(message), { status }); };
@@ -91,7 +92,7 @@ function createMailService({ ImapClient = ImapFlow, createTransport = nodemailer
         if (!message?.source) fail('Message not found.', 404);
         const parsed = await simpleParser(message.source, { skipHtmlToText: false, skipTextToHtml: true, skipImageLinks: true, maxHtmlLengthToParse: MAX_MESSAGE_SIZE });
         await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true });
-        return { ...summary(message), seen: true, cc: addresses(parsed.cc?.value), replyTo: addresses(parsed.replyTo?.value || parsed.from?.value), text: parsed.text || '', attachments: (parsed.attachments || []).map(item => ({ filename: item.filename || 'Attachment', size: item.size })) };
+        return { ...summary(message), seen: true, cc: addresses(parsed.cc?.value), replyTo: addresses(parsed.replyTo?.value || parsed.from?.value), text: parsed.text || '', attachments: await attachmentPreviews(parsed.attachments) };
       } finally { lock.release(); }
     }),
     async send(account, message) {
