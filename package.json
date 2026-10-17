@@ -4,7 +4,7 @@
   "description": "Neximet Multi-Department Enterprise Portal Backend",
   "main": "src/server.js",
   "engines": {
-    "node": "22.x"
+    "node": ">=20.0.0"
   },
   "scripts": {
     "start": "node --experimental-require-module src/server.js",
