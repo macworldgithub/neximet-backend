@@ -2,7 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const { randomUUID } = require('node:crypto');
-const { createAIService, readEvents, validateTurn } = require('../src/services/ai');
+const { createAIService, readEvents, validateTurn, providerError } = require('../src/services/ai');
 const { encryptKey, decryptKey, encryptionKey } = require('../src/services/aiCrypto');
 const { createAIHandlers } = require('../src/controllers/aiController');
 const ConnectionModel = require('../src/models/AIConnection');
@@ -78,6 +78,36 @@ test('adapters flag limited replies and reject a stream ending without a complet
 test('upstream credentials and raw errors are never reflected; quota failures remain actionable', async () => {
   const service = createAIService({ fetchImpl: async () => new Response('secret-api-key and private prompt', { status: 429 }) });
   await assert.rejects(service.models('openai', 'secret-api-key'), error => error.status === 429 && !error.message.includes('secret-api-key') && /credit/.test(error.message));
+});
+test('OpenAI HTTP-200 streaming billing errors are identified at both top-level and response.failed paths', async () => {
+  for (const event of [{ type: 'error', code: 'credit_balance_exhausted', message: 'raw-private-key-and-prompt' }, { type: 'response.failed', response: { error: { code: 'credit_balance_exhausted', message: 'raw-private-key-and-prompt' } } }]) {
+    let calls = 0;
+    const service = createAIService({ fetchImpl: async () => { calls++; return fakeResponse(sse([event])); } });
+    await assert.rejects(service.generate({ provider: 'openai', key: 'private-key', model: 'gpt-test', messages: [], signal: new AbortController().signal, onText() {} }), error => error.status === 402 && error.code === 'ai_billing_required' && /OpenAI API credits/.test(error.message) && !error.message.includes('raw-private'));
+    assert.equal(calls, 1);
+  }
+});
+test('Claude HTTP-400 low-credit and Gemini billing errors use safe, actionable messages', async () => {
+  for (const [provider, status, error] of [
+    ['claude', 400, { type: 'invalid_request_error', message: 'Your credit balance is too low to access the Anthropic API. raw-private-key-and-prompt' }],
+    ['gemini', 402, { status: 'FAILED_PRECONDITION', message: 'raw-private-key-and-prompt' }],
+    ['gemini', 403, { status: 'PERMISSION_DENIED', message: 'Billing is not enabled for this project. raw-private-key-and-prompt' }],
+  ]) {
+    const service = createAIService({ fetchImpl: async () => Response.json({ error }, { status }) });
+    await assert.rejects(service.generate({ provider, key: 'private-key', model: 'test', messages: [], signal: new AbortController().signal, onText() {} }), error => error.status === 402 && error.code === 'ai_billing_required' && !error.message.includes('raw-private'));
+  }
+});
+test('spending limits, rate limits, and real provider outages remain distinct from depleted credits', () => {
+  assert.equal(providerError(429, { error: { code: 'project_spend_limit_exceeded', type: 'insufficient_quota' } }).code, 'ai_spend_limit');
+  assert.equal(providerError(502, { error: { type: 'rate_limit_error' } }).code, 'ai_rate_limit');
+  assert.equal(providerError(503, { error: { code: 'server_is_overloaded' } }).code, 'ai_provider_unavailable');
+  assert.equal(providerError(401, { error: { code: 'invalid_api_key' } }).code, 'ai_auth_error');
+});
+test('Gemini free-tier quota exhaustion stops without retries or a billing-required message', async () => {
+  let calls = 0;
+  const service = createAIService({ fetchImpl: async () => { calls++; return Response.json({ error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: 'Free tier quota exceeded. private-key' } }, { status: 429 }); } });
+  await assert.rejects(service.generate({ provider: 'gemini', key: 'private-key', model: 'gemini-test', messages: [{ role: 'user', content: 'Hello' }], signal: new AbortController().signal, onText() {} }), error => error.status === 429 && error.code === 'ai_quota_exhausted' && /reset/.test(error.message) && !/billing|private-key/i.test(error.message));
+  assert.equal(calls, 1);
 });
 test('model discovery filters unsupported models, paginates Gemini, and does not generate a paid reply', async () => {
   const requests = [];
@@ -202,6 +232,14 @@ test('provider failures preserve partial text, clear leases, and do not leak raw
   await setup(h); const result = await h.call('send', { body: turn('hello') });
   assert.equal(h.chats.get(chatId).messages[1].content, 'partial reply'); assert.equal(h.chats.get(chatId).messages[1].status, 'error');
   assert.ok(!h.chats.get(chatId).activeRequest); assert.ok(!result.output.includes('private-api-key')); assert.match(result.output, /"type":"error"/);
+});
+test('billing cause is saved and returned on reload without raw provider messages or keys', async () => {
+  const h = harness({ async models() { return [{ id: 'gpt-test', name: 'Test' }]; }, async generate() { throw providerError(502, { provider: 'openai', error: { code: 'credit_balance_exhausted', message: 'raw-private-key-and-prompt' } }); } });
+  await setup(h);
+  const response = await h.call('send', { body: turn('hello') });
+  assert.match(response.output, /ai_billing_required/); assert.ok(!response.output.includes('raw-private'));
+  const saved = (await h.call('read')).body.conversation.messages[1];
+  assert.equal(saved.status, 'error'); assert.equal(saved.errorCode, 'ai_billing_required'); assert.match(saved.errorMessage, /OpenAI API credits/);
 });
 test('Stop/disconnect aborts upstream generation and persists a partial reply', async () => {
   let begun;

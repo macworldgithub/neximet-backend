@@ -10,11 +10,25 @@ function validateTurn(body) {
   if (typeof body.requestId !== 'string' || !/^[a-f\d]{8}-[a-f\d]{4}-4[a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/i.test(body.requestId)) fail('Invalid message request. Refresh and try again.');
   return { text: body.text.trim(), requestId: body.requestId };
 }
-function providerError(status) {
-  if ([401, 403].includes(status)) return Object.assign(new Error('This provider rejected the API key or model access. Check AI connections and your provider permissions.'), { status: 422 });
-  if (status === 429) return Object.assign(new Error('The provider limit or API credit balance has been reached. Check your provider billing and try again later.'), { status: 429 });
-  if ([400, 404].includes(status)) return Object.assign(new Error('The provider could not use this model or conversation. Refresh models in AI connections, or start a new chat with another model.'), { status: 422 });
-  return Object.assign(new Error('The AI provider is unavailable or the response was interrupted. Please try again shortly.'), { status: 502 });
+function providerError(status, { provider, error = {} } = {}) {
+  const name = { openai: 'OpenAI', claude: 'Claude', gemini: 'Gemini' }[provider] || 'This provider';
+  const codes = [error.code, error.type, error.status].filter(value => typeof value === 'string').map(value => value.toLowerCase());
+  // Only use upstream text for classification; never echo or persist it. Claude
+  // reports low credit as HTTP 400/invalid_request_error, without a billing code.
+  const message = typeof error.message === 'string' ? error.message : '';
+  const make = (message, status, code) => Object.assign(new Error(message), { status, code });
+  // Specific machine codes take precedence over a broad insufficient_quota type.
+  if (codes.some(code => ['organization_spend_limit_exceeded', 'project_spend_limit_exceeded', 'organization_usage_limit_exceeded', 'billing_hard_limit_reached', 'usage_limit_exceeded'].includes(code))) {
+    return make(`${name} has reached an API spending or usage limit. Check the limits in your provider's API billing settings before sending again.`, 429, 'ai_spend_limit');
+  }
+  if (status === 402 || codes.some(code => ['credit_balance_exhausted', 'insufficient_quota', 'insufficient_credits', 'billing_not_active', 'billing_disabled'].includes(code)) || /credit balance.*(?:low|exhausted|depleted|insufficient)|insufficient.*credits|(?:exhausted|depleted).*credits|billing.*(?:not enabled|disabled|not active)|(?:enable|set up).*billing|purchase.*credits/i.test(message)) {
+    return make(`${name} API credits are insufficient or API billing is not enabled. Check your provider's API billing balance and add or enable credits before sending again.`, 402, 'ai_billing_required');
+  }
+  if ([401, 403].includes(status) || codes.some(code => ['authentication_error', 'permission_error', 'permission_denied', 'unauthenticated', 'invalid_api_key'].includes(code))) return make('This provider rejected the API key or model access. Check AI connections and your provider permissions.', 422, 'ai_auth_error');
+  if (provider === 'gemini' && (status === 429 || codes.includes('resource_exhausted'))) return make('Gemini request or token quota has been reached. Wait for the applicable limit to reset, then send again. Check the quota for your project and selected model in Google AI Studio.', 429, 'ai_quota_exhausted');
+  if (status === 429 || codes.some(code => ['rate_limit_error', 'rate_limit_exceeded', 'resource_exhausted'].includes(code))) return make('The provider limit or API credit quota has been reached. Check provider usage and billing, or wait for the rate limit to reset.', 429, 'ai_rate_limit');
+  if ([400, 404].includes(status) || codes.some(code => ['invalid_request_error', 'invalid_request', 'invalid_argument', 'not_found_error', 'model_not_found', 'context_length_exceeded'].includes(code))) return make('The provider could not use this model or conversation. Refresh models in AI connections, or start a new chat with another model.', 422, 'ai_invalid_request');
+  return make('The AI provider is unavailable or the response was interrupted. Please try again shortly.', 502, 'ai_provider_unavailable');
 }
 
 // Parse SSE incrementally, including UTF-8 characters and CRLF split across chunks.
@@ -50,8 +64,11 @@ function createAIService({ fetchImpl = fetch } = {}) {
     // Hosts/paths are application-owned; keys are headers, never URL parameters.
     let response;
     try { response = await fetchImpl(url, { ...options, redirect: 'error', headers: headers(provider, key) }); }
-    catch (error) { if (options.signal?.aborted) throw error; throw providerError(502); }
-    if (!response.ok) { await response.body?.cancel().catch(() => {}); throw providerError(response.status); }
+    catch (error) { if (options.signal?.aborted) throw error; throw providerError(502, { provider }); }
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      throw providerError(response.status, { provider, error: payload?.error || {} });
+    }
     return response;
   }
   return {
@@ -108,7 +125,12 @@ function createAIService({ fetchImpl = fetch } = {}) {
       let complete = false, limited = false, size = 0;
       for await (const event of readEvents(response.body)) {
         if (signal.aborted) throw signal.reason;
-        if (event.error || ['error', 'response.failed'].includes(event.type)) throw providerError(event.error?.type === 'rate_limit_error' ? 429 : 502);
+        // OpenAI can return HTTP 200, then an `error` with top-level `code`,
+        // followed by response.failed with the cause nested at response.error.
+        if (event.error || ['error', 'response.failed'].includes(event.type)) {
+          const error = event.error || event.response?.error || event;
+          throw providerError(typeof error.code === 'number' ? error.code : 502, { provider, error });
+        }
         let text = '';
         if (provider === 'openai') {
           if (event.type === 'response.output_text.delta') text = event.delta || '';

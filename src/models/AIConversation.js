@@ -6,6 +6,8 @@ const message = new mongoose.Schema({
   role: { type: String, enum: ['user', 'assistant'], required: true },
   content: { type: String, default: '' },
   status: { type: String, enum: ['complete', 'pending', 'stopped', 'error', 'limited'], default: 'complete' },
+  errorMessage: { type: String, default: '', maxlength: 500 },
+  errorCode: { type: String, default: '', maxlength: 80 },
   createdAt: { type: Date, default: Date.now },
 }, { _id: false });
 const schema = new mongoose.Schema({

@@ -13,6 +13,7 @@ const User = require('../src/models/User');
 const Connection = require('../src/models/AIConnection');
 const Conversation = require('../src/models/AIConversation');
 const { createAIRouter } = require('../src/routes/aiRoutes');
+const { providerError } = require('../src/services/ai');
 
 process.env.JWT_SECRET = 'isolated-ai-test-secret';
 process.env.AI_ENCRYPTION_KEY = 'c1'.repeat(32);
@@ -92,4 +93,12 @@ test('concurrent HTTP sends respect the MongoDB lease and stale pending replies 
   await Conversation.updateOne({ _id: chat._id }, { $set: { activeRequest: { requestId: 'expired', expiresAt: new Date(Date.now() - 1000) } }, $push: { messages: { id: crypto.randomUUID(), requestId: crypto.randomUUID(), role: 'assistant', status: 'pending', content: '' } } });
   const recovered = await (await request(alice, `/conversations/${chat._id}`)).json();
   assert.equal(recovered.conversation.generating, false); assert.equal(recovered.conversation.messages.at(-1).status, 'stopped');
+});
+test('a billing failure persists its safe cause through MongoDB and a subsequent HTTP read', async () => {
+  generate = async () => { throw providerError(400, { provider: 'claude', error: { type: 'invalid_request_error', message: 'Your credit balance is too low. private-provider-api-key' } }); };
+  const response = await request(alice, `/conversations/${chat._id}/messages`, { text: 'Billing test', requestId: crypto.randomUUID() });
+  const stream = await response.text(); assert.match(stream, /ai_billing_required/); assert.ok(!stream.includes('private-provider-api-key'));
+  const saved = await (await request(alice, `/conversations/${chat._id}`)).json();
+  assert.equal(saved.conversation.messages.at(-1).errorCode, 'ai_billing_required');
+  assert.match(saved.conversation.messages.at(-1).errorMessage, /Claude API credits/);
 });

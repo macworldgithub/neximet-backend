@@ -29,7 +29,7 @@ function createAIHandlers({ Connection = ConnectionModel, Conversation = Convers
     try { await handler(req, res); }
     catch (error) {
       // Raw provider/DB errors can contain credentials or private prompts.
-      if (!res.headersSent) res.status(error.status || 500).json({ success: false, message: error.status ? error.message : 'Unable to complete this AI request. Please try again.' });
+      if (!res.headersSent) res.status(error.status || 500).json({ success: false, message: error.status ? error.message : 'Unable to complete this AI request. Please try again.', code: /^ai_[a-z_]+$/.test(error.code || '') ? error.code : undefined });
       else if (!res.writableEnded) res.end();
     }
   };
@@ -119,7 +119,7 @@ function createAIHandlers({ Connection = ConnectionModel, Conversation = Convers
       if (!locked.modifiedCount) fail('A reply is already in progress. Wait for it to finish, then try again.', 409);
 
       const abort = new AbortController();
-      let timedOut = false, content = '', status = 'complete', errorMessage = '';
+      let timedOut = false, content = '', status = 'complete', errorMessage = '', errorCode = '';
       const timer = setTimeout(() => { timedOut = true; abort.abort(); }, timeoutMs);
       const disconnect = () => { if (!res.writableEnded) abort.abort(); };
       res.on('close', disconnect);
@@ -137,15 +137,16 @@ function createAIHandlers({ Connection = ConnectionModel, Conversation = Convers
       } catch (error) {
         status = abort.signal.aborted ? 'stopped' : 'error';
         errorMessage = timedOut ? 'This reply reached the time limit. You can ask the model to continue.' : abort.signal.aborted ? '' : error.status ? error.message : 'The reply was interrupted. Please try again.';
+        errorCode = !abort.signal.aborted && /^ai_[a-z_]+$/.test(error.code || '') ? error.code : '';
       } finally {
         clearTimeout(timer); clearInterval(heartbeat); res.off('close', disconnect);
         try {
           const saved = await Conversation.updateOne({ ...filter, 'activeRequest.requestId': requestId }, {
-            $set: { 'messages.$[reply].content': content, 'messages.$[reply].status': status }, $unset: { activeRequest: 1 },
+            $set: { 'messages.$[reply].content': content, 'messages.$[reply].status': status, 'messages.$[reply].errorMessage': errorMessage, 'messages.$[reply].errorCode': errorCode }, $unset: { activeRequest: 1 },
           }, { arrayFilters: [{ 'reply.id': assistant.id }] });
           if (!saved.modifiedCount) throw new Error();
-          if (errorMessage) emit('error', { message: errorMessage });
-          emit('done', { message: { ...assistant, content, status } });
+          if (errorMessage) emit('error', { message: errorMessage, code: errorCode });
+          emit('done', { message: { ...assistant, content, status, errorMessage, errorCode } });
         } catch {
           emit('error', { message: 'The reply could not be saved. Copy it before leaving this page.' });
         }
