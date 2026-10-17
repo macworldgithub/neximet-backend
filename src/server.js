@@ -138,6 +138,7 @@ app.use('/api/leaves', require('./routes/leaveRoutes'));
 app.use('/api/dashboard', require('./routes/dashboardRoutes'));
 app.use('/api/chat', require('./routes/chatRoutes'));
 app.use('/api/mail', require('./routes/mailRoutes'));
+app.use('/api/ai', require('./routes/aiRoutes'));
 
 // Health check
 app.get('/api/health', (req, res) => {

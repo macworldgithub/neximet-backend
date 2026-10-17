@@ -3,6 +3,9 @@
   "env": {
     "NODE_OPTIONS": "--experimental-require-module"
   },
+  "functions": {
+    "api/index.js": { "maxDuration": 120 }
+  },
   "rewrites": [
     {
       "source": "/(.*)",

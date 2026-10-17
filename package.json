@@ -11,6 +11,7 @@
     "dev": "node --watch src/server.js",
     "test:chat": "node --test test/chat.test.js",
     "test:mail": "node --test test/mail.test.js test/mail-runtime.test.js",
+    "test:ai": "node --test test/ai.test.js test/ai-integration.test.js",
     "test:attendance": "node --test test/attendance-policy.test.js test/attendance.test.js",
     "seed": "node src/seed/seedRealUsers.js",
     "seed:legacy": "node src/seed/seedData.js"
