@@ -202,11 +202,13 @@ exports.uploadScopeDocument = async (req, res) => {
       fileUrl: newDoc.fileUrl,
       fileType: newDoc.fileType,
       fileSize: newDoc.fileSize,
-      fileData: newDoc.fileData,
       uploadedAt: newDoc.uploadedAt,
       summary: newDoc.summary,
     };
 
+    if (require('mongoose').mongo.BSON.calculateObjectSize(project.toObject()) > 15 * 1024 * 1024) {
+      return res.status(413).json({ success: false, message: 'This project has reached its document storage limit. Remove an older document or upload a smaller file.' });
+    }
     await project.save();
 
     // Return response without huge fileData payload

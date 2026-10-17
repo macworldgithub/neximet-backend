@@ -85,6 +85,34 @@ after(async () => {
   if (directory && path.dirname(path.resolve(directory)) === testTempRoot && path.basename(directory).startsWith('neximet-attendance-test-')) await rm(directory, { recursive: true, force: true });
 });
 
+test('the complete production app preserves CEO-only pay and authorizes persistent scope downloads and size limits', async t => {
+  const Project = require('../src/models/Project'); await Project.init();
+  const project = await Project.create({ title: 'Isolated VPS scope', code: 'VPS-ISOLATED-TEST', clientName: 'Synthetic', department: 'Graphics Designing', deadline: new Date(), assignedMembers: [{ user: people[0]._id }] });
+  const { createApp } = require('../src/app');
+  const { runtimeConfig } = require('../src/config/runtime');
+  const app = createApp({ config: runtimeConfig({ NODE_ENV: 'production' }), connect: async () => mongoose.connection });
+  const listener = app.listen(0, '127.0.0.1'); await new Promise(resolve => listener.once('listening', resolve));
+  t.after(async () => { listener.closeAllConnections(); await new Promise(resolve => listener.close(resolve)); await Project.deleteOne({ _id: project._id }); });
+  const origin = 'http://127.0.0.1:' + listener.address().port;
+  const headers = user => ({ Authorization: 'Bearer ' + token.get(user.id), Origin: 'https://portal.neximet.com' });
+  assert.equal((await fetch(origin + '/api/health')).status, 200);
+  const directory = await fetch(origin + '/api/auth/users', { headers: headers(people[3]) });
+  assert.equal(directory.status, 200); assert.ok((await directory.json()).users.every(user => user.baseSalary === undefined && user.dailyWage === undefined));
+  const upload = async name => {
+    const body = new FormData(); body.append('scopeFile', new Blob([Buffer.alloc(6 * 1024 * 1024, 'a')], { type: 'application/pdf' }), name);
+    return fetch(origin + `/api/projects/${project.id}/scope`, { method: 'POST', headers: headers(people[2]), body });
+  };
+  const first = await upload('private.pdf'); assert.equal(first.status, 200, await first.text());
+  const saved = await Project.findById(project._id); const file = saved.scopeDocuments[0];
+  assert.equal(saved.scopeDocument.fileData || '', ''); assert.equal(saved.scopeDocuments.length, 1);
+  assert.equal((await fetch(origin + file.fileUrl)).status, 401);
+  assert.equal((await fetch(origin + file.fileUrl, { headers: headers(people[4]) })).status, 404);
+  const document = await fetch(origin + file.fileUrl, { headers: headers(people[0]) });
+  assert.equal(document.status, 200); assert.equal((await document.arrayBuffer()).byteLength, 6 * 1024 * 1024); assert.equal(document.headers.get('cache-control'), 'private, no-store');
+  const oversized = await upload('second.pdf'); assert.equal(oversized.status, 413); await oversized.text();
+  assert.equal((await Project.findById(project._id)).scopeDocuments.length, 1);
+});
+
 test('real arrivals charge every second monthly late and separately charge arrivals strictly after 2 PM', async t => {
   await User.updateOne({ _id: people[0]._id }, { $set: { joinDate: p.atCompanyTime('2026-09-01', '00:00'), baseSalary: 150000, dailyWage: 5 } });
   await DeductionRule.updateOne({}, { $set: { shiftStartTime: '09:00', shiftEndTime: '18:00' } });

@@ -16,7 +16,7 @@ const fileFilter = (req, file, cb) => {
 
 const upload = multer({
   storage,
-  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB max file size (aligned with MongoDB 16MB doc limit)
+  limits: { fileSize: 10 * 1024 * 1024, files: 1, fields: 5, fieldSize: 16000 }, // Base64 expands data before MongoDB's 16 MiB document limit.
   fileFilter,
 });
 

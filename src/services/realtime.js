@@ -6,14 +6,16 @@ const mongoose = require('mongoose');
 const connectDB = require('../config/db');
 const User = require('../models/User');
 const ChatEvent = require('../models/ChatEvent');
+const { corsOptions, originAllowed, runtimeConfig } = require('../config/runtime');
 
-function createRealtimeServer(app, { pollInterval = 1000 } = {}) {
+function createRealtimeServer(app, { pollInterval = 1000, config = runtimeConfig() } = {}) {
   const server = createServer(app);
   const io = new Server(server, {
     path: '/api/socket.io',
     transports: ['websocket'],
     maxHttpBufferSize: 16000,
-    cors: { origin: true, credentials: true },
+    cors: corsOptions(config),
+    allowRequest: (req, callback) => callback(null, originAllowed(req.headers.origin, config)),
     pingInterval: 20000,
     pingTimeout: 20000,
   });

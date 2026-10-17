@@ -129,7 +129,9 @@ test('authentication and teammate directory exclude inactive users and private f
   assert.deepEqual(result.body.people.map((person) => person.name), ['Bob', 'Carol']);
   assert.equal(JSON.stringify(result.body).includes('999999'), false);
   assert.equal(result.body.people[0].password, undefined);
-  assert.equal(result.headers.get('cache-control'), 'no-store');
+  assert.equal(result.body.people[0].baseSalary, undefined);
+  assert.equal(result.body.people[0].dailyWage, undefined);
+  assert.equal(result.headers.get('cache-control'), 'private, no-store');
 });
 test('concurrent direct creation, reverse participants, and uppercase IDs reuse a single conversation', async () => {
   const results = await Promise.all(Array.from({ length: 6 }, () => request(alice, '/conversations', { kind: 'direct', participantIds: [String(bob._id).toUpperCase()] })));

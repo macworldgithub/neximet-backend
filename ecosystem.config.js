@@ -1,0 +1,23 @@
+module.exports = {
+  apps: [{
+    name: 'neximet-backend',
+    cwd: __dirname,
+    script: 'src/server.js',
+    interpreter: 'node',
+    node_args: ['--experimental-require-module'],
+    instances: 1,
+    exec_mode: 'fork',
+    env: { NODE_ENV: 'production', PORT: '4052', HOST: '127.0.0.1', TRUST_PROXY: 'loopback', TZ: 'Asia/Karachi' },
+    wait_ready: true,
+    listen_timeout: 45000,
+    kill_timeout: 20000,
+    min_uptime: '10s',
+    max_restarts: 10,
+    restart_delay: 3000,
+    max_memory_restart: '768M',
+    autorestart: true,
+    watch: false,
+    time: true,
+    merge_logs: true,
+  }],
+};
