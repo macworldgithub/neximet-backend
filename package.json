@@ -3,11 +3,14 @@
   "version": "1.0.0",
   "description": "Neximet Multi-Department Enterprise Portal Backend",
   "main": "src/server.js",
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "test:chat": "node --test test/chat.test.js",
-    "test:mail": "node --test test/mail.test.js",
+    "test:mail": "node --test test/mail.test.js test/mail-runtime.test.js",
     "test:attendance": "node --test test/attendance-policy.test.js test/attendance.test.js",
     "seed": "node src/seed/seedRealUsers.js",
     "seed:legacy": "node src/seed/seedData.js"
@@ -25,7 +28,7 @@
     "morgan": "^1.10.0",
     "multer": "^1.4.5-lts.1",
     "nodemailer": "^10.1.2",
-    "sanitize-html": "^2.18.1",
+    "sanitize-html": "2.18.1",
     "sharp": "^0.35.5",
     "socket.io": "^4.8.4",
     "web-push": "^3.6.7"
