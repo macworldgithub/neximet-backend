@@ -15,6 +15,8 @@ const { createRealtimeServer } = require('../src/services/realtime');
 const { iceConfiguration } = require('../src/services/calls');
 const User = require('../src/models/User');
 const Conversation = require('../src/models/Conversation');
+const CallSession = require('../src/models/CallSession');
+const Meeting = require('../src/models/Meeting');
 process.env.JWT_SECRET = 'isolated-call-tests-secret';
 let mongo, directory, realtime, users, group, direct;
 const clients = [];
@@ -38,11 +40,14 @@ before(async () => {
   users = await User.create(Array.from({ length: 11 }, (_, i) => ({ name: `Caller ${i}`, email: `call-${i}@example.test`, password: 'isolated-call-only', department: 'Software Development' })));
   group = await Conversation.create({ kind: 'group', name: 'Call test team', createdBy: users[0]._id, members: users.slice(0, 10).map(user => ({ user: user._id })) });
   direct = await Conversation.create({ kind: 'direct', createdBy: users[0]._id, members: users.slice(0, 2).map(user => ({ user: user._id })) });
-  realtime = createRealtimeServer(express());
+  const app = express(); app.use(express.json()); app.use('/api/meetings', require('../src/routes/meetingRoutes'));
+  app.use((error, req, res, next) => res.status(error.status || 500).json({ success: false, message: error.message }));
+  realtime = createRealtimeServer(app);
   await new Promise(resolve => realtime.server.listen(0, '127.0.0.1', resolve));
 });
 after(async () => {
   clients.forEach(client => client.disconnect());
+  if (realtime) await realtime.closeCalls();
   if (realtime) await new Promise(resolve => realtime.io.close(resolve));
   await mongoose.disconnect();
   if (mongo && mongo.exitCode === null) { const stopped = new Promise(resolve => mongo.once('exit', resolve)); mongo.kill(); await stopped; }
@@ -56,6 +61,15 @@ async function connect(index) {
 }
 const command = (client, event, payload) => client.timeout(5000).emitWithAck(event, payload);
 const join = (client, conversation = group, extra = {}) => command(client, 'call:join', { conversationId: String(conversation._id), mode: 'video', microphone: true, camera: true, ...extra });
+async function request(index, endpoint, body, method = body ? 'POST' : 'GET') {
+  const response = await fetch(`http://127.0.0.1:${realtime.server.address().port}/api/meetings${endpoint}`, {
+    method, headers: { ...(index == null ? {} : { Authorization: `Bearer ${jwt.sign({ id: users[index]._id }, process.env.JWT_SECRET)}` }), ...(body ? { 'Content-Type': 'application/json' } : {}) },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  return { status: response.status, body: await response.json(), cache: response.headers.get('cache-control') };
+}
+const schedule = (minutes = 60) => ({ conversationId: String(direct._id), title: 'Delivery review', description: 'Review the release',
+  startsAt: new Date(Date.now() + minutes * 60000).toISOString(), endsAt: new Date(Date.now() + (minutes + 30) * 60000).toISOString(), timezone: 'Asia/Karachi', mode: 'audio' });
 function event(client, name, predicate = () => true) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => { client.off(name, receive); reject(new Error(`Missing ${name}`)); }, 5000);
@@ -154,4 +168,94 @@ test('disabled accounts lose call access on the next command', async () => {
   await User.updateOne({ _id: users[9]._id }, { isActive: false });
   await assert.rejects(command(client, 'call:config', {}));
   client.disconnect();
+});
+
+test('calendar invitations are persistent, private, validated, and editable only by the organizer', async () => {
+  assert.equal((await request(null, '/upcoming')).status, 401);
+  assert.equal((await request(10, '', schedule())).status, 404);
+  for (const body of [{ ...schedule(), timezone: 'Invalid/Zone' }, { ...schedule(), startsAt: new Date(Date.now() - 3600000).toISOString() }, { ...schedule(), title: '' }]) {
+    assert.equal((await request(0, '', body)).status, 400);
+  }
+  const created = await request(0, '', { ...schedule(), participants: [String(users[10]._id)] });
+  assert.equal(created.status, 201);
+  const meeting = created.body.meeting, id = meeting._id;
+  assert.equal(meeting.participants.length, 2);
+  assert.deepEqual(meeting.participants.map(person => person.name).sort(), ['Caller 0', 'Caller 1']);
+  assert.equal(meeting.participants[0].email, undefined);
+  assert.equal((await request(10, `/${id}`)).status, 404);
+  const calendar = await request(1, `?from=${encodeURIComponent(new Date(Date.now() - 86400000).toISOString())}&to=${encodeURIComponent(new Date(Date.now() + 86400000).toISOString())}`);
+  assert.equal(calendar.cache, 'private, no-store');
+  assert.ok(calendar.body.meetings.some(item => item._id === id));
+  assert.equal((await request(1, `/${id}/rsvp`, { response: 'accepted' })).body.meeting.responses.length, 2);
+  assert.equal((await request(1, `/${id}`, schedule(), 'PATCH')).status, 403);
+  const edited = await request(0, `/${id}`, { ...schedule(90), title: 'Updated review' }, 'PATCH');
+  assert.equal(edited.body.meeting.title, 'Updated review'); assert.equal(edited.body.meeting.responses.length, 1);
+  assert.equal((await request(1, `/${id}/cancel`, {})).status, 403);
+  assert.equal((await request(0, `/${id}/cancel`, {})).body.meeting.status, 'cancelled');
+  const client = await connect(0);
+  assert.equal((await join(client, direct, { meetingId: id })).success, false); client.disconnect();
+});
+
+test('scheduled calls enforce join windows and record actual attendance and missed/declined outcomes', async () => {
+  const id = (await request(0, '', schedule(60))).body.meeting._id;
+  const [alice, bob, carol] = await Promise.all([connect(0), connect(1), connect(2)]);
+  assert.equal((await join(alice, direct, { meetingId: id })).success, false);
+  await request(0, `/${id}`, schedule(10), 'PATCH');
+  const started = await join(alice, direct, { meetingId: id, mode: 'audio', camera: false });
+  assert.equal(started.success, true); assert.equal(started.call.meetingId, id);
+  assert.equal((await request(0, `/${id}`)).body.meeting.status, 'in_progress');
+  assert.equal((await request(0, `/${id}/cancel`, {})).status, 409);
+  const payload = { conversationId: String(direct._id), callId: started.call.id };
+  await command(bob, 'call:decline', payload);
+  let history = (await request(1, '/history')).body.history.find(item => item.callId === started.call.id);
+  assert.equal(history.outcome, 'declined');
+  await join(bob, direct, { meetingId: id });
+  assert.equal((await join(carol, direct, { meetingId: id })).success, false);
+  await command(alice, 'call:end', payload);
+  const stored = await CallSession.findOne({ callId: started.call.id }).lean();
+  assert.equal(stored.attendance.length, 2); assert.ok(stored.attendance.every(item => item.leftAt)); assert.equal(stored.endReason, 'host_ended');
+  history = (await request(1, '/history')).body.history.find(item => item.callId === started.call.id);
+  assert.equal(history.outcome, 'attended'); assert.equal(history.meeting, id); assert.equal(history.attendance.length, 2);
+  assert.equal((await request(0, `/${id}`)).body.meeting.status, 'completed');
+  assert.equal((await join(alice, direct, { meetingId: id })).success, false);
+  alice.disconnect(); bob.disconnect(); carol.disconnect();
+});
+
+test('unanswered invitations and interrupted server sessions remain in personal history', async () => {
+  const alice = await connect(0);
+  const started = await join(alice, group);
+  await command(alice, 'call:end', { conversationId: String(group._id), callId: started.call.id });
+  assert.equal((await request(0, '/history')).body.history.find(item => item.callId === started.call.id).outcome, 'unanswered');
+  assert.equal((await request(2, '/history')).body.history.find(item => item.callId === started.call.id).outcome, 'missed');
+  assert.equal((await request(10, '/history')).body.history.length, 0);
+  const meeting = await Meeting.create({ ...schedule(10), conversation: direct._id, organizer: users[0]._id, participants: [users[0]._id], status: 'in_progress', activeCallId: 'interrupted-test' });
+  const lastSeenAt = new Date(Date.now() - 300000);
+  await CallSession.create({ callId: 'interrupted-test', conversation: direct._id, meeting: meeting._id, startedBy: users[0]._id, invitedUsers: [users[0]._id], title: 'Interrupted call', mode: 'audio', startedAt: new Date(+lastSeenAt - 65000), lastSeenAt, attendance: [{ user: users[0]._id, joinedAt: new Date(+lastSeenAt - 65000) }] });
+  const interrupted = (await request(0, '/history')).body.history.find(item => item.callId === 'interrupted-test');
+  assert.equal(interrupted.endReason, 'server_disconnected'); assert.equal(interrupted.durationSeconds, 65); assert.equal(interrupted.attendanceSeconds, 65);
+  assert.equal((await Meeting.findById(meeting._id)).status, 'completed');
+  alice.disconnect();
+});
+
+test('history pagination is private and returns older records without duplicates', async () => {
+  await CallSession.insertMany(Array.from({ length: 25 }, (_, index) => ({ callId: `pagination-${index}`, conversation: direct._id, startedBy: users[0]._id, invitedUsers: [users[0]._id], title: `Past meeting ${index}`, mode: 'audio', startedAt: new Date(Date.now() - 60000), lastSeenAt: new Date(), endedAt: new Date(), attendance: [] })));
+  const first = await request(0, '/history'); assert.equal(first.body.history.length, 20); assert.equal(first.body.hasMore, true);
+  const next = await request(0, `/history?before=${first.body.history[19]._id}`);
+  assert.ok(next.body.history.length > 0); assert.ok(!next.body.history.some(item => first.body.history.some(previous => previous._id === item._id)));
+  assert.equal((await request(0, '/history?before=invalid')).status, 400);
+  const searched = await request(0, '/history?q=Past%20meeting%2024');
+  assert.equal(searched.body.history.length, 1); assert.equal(searched.body.history[0].title, 'Past meeting 24');
+  assert.equal((await request(0, '/history?q=%5B')).status, 200);
+  assert.equal((await request(0, '/history?q[x]=object')).status, 400);
+});
+
+test('graceful shutdown closes attendance before the database disconnects', async () => {
+  const alice = await connect(0);
+  const started = await join(alice, direct);
+  await realtime.closeCalls();
+  const session = await CallSession.findOne({ callId: started.call.id }).lean();
+  assert.equal(session.endReason, 'server_disconnected');
+  assert.ok(session.endedAt); assert.ok(session.attendance[0].leftAt);
+  assert.equal((await join(alice, direct)).success, false);
+  alice.disconnect();
 });

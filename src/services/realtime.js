@@ -116,10 +116,11 @@ function createRealtimeServer(app, { pollInterval = 1000, config = runtimeConfig
     socket.on('disconnect', () => { if (expires) clearTimeout(expires); });
   });
   server.on('close', () => {
+    void calls.close().catch(error => console.warn('Meeting shutdown cleanup failed:', error.message));
     closed = true;
     if (pollTimer) clearInterval(pollTimer);
     if (stream) void stream.close().catch(() => {});
   });
-  return { server, io };
+  return { server, io, closeCalls: calls.close };
 }
 module.exports = { createRealtimeServer };

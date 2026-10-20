@@ -7,7 +7,7 @@ async function verifyDatabase(connection, { production = false } = {}) {
 async function startServer(app, { config, connect, mongoose, createRealtimeServer, shutdownMs = 15000 } = {}) {
   await connect();
   await verifyDatabase(mongoose.connection, config);
-  const { server, io } = createRealtimeServer(app, { config });
+  const { server, io, closeCalls } = createRealtimeServer(app, { config });
   // Nginx has a 60-second upstream idle timeout.
   server.keepAliveTimeout = 70000;
   server.headersTimeout = 75000;
@@ -25,7 +25,7 @@ async function startServer(app, { config, connect, mongoose, createRealtimeServe
     console.log(`Received ${signal}; draining connections.`);
     const deadline = setTimeout(() => { server.closeAllConnections?.(); process.exit(1); }, shutdownMs);
     deadline.unref();
-    stopping = new Promise(resolve => io.close(resolve)).then(() => mongoose.disconnect()).finally(() => {
+    stopping = Promise.resolve().then(() => closeCalls?.()).then(() => new Promise(resolve => io.close(resolve))).then(() => mongoose.disconnect()).finally(() => {
       clearTimeout(deadline);
       process.removeListener('SIGINT', onInterrupt); process.removeListener('SIGTERM', onTerminate);
     });

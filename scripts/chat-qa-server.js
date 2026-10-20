@@ -59,6 +59,7 @@ async function main() {
   app.get('/api/attendance/today', (req, res) => res.json({ success: true, attendance: null }));
   app.get('/api/leaves/summary', (req, res) => res.json({ success: true, totalHolidaysLeft: 32 }));
   app.use('/api/chat', require('../src/routes/chatRoutes'));
+  app.use('/api/meetings', require('../src/routes/meetingRoutes'));
   app.use((error, req, res, next) => res.status(error.status || 500).json({ success: false, message: error.message }));
   realtime = require('../src/services/realtime').createRealtimeServer(app, { pollInterval: 100 });
   server = realtime.server.listen(Number(process.env.QA_PORT || 4011), '127.0.0.1', () => console.log(`Temporary chat QA API on port ${server.address().port}. Synthetic accounts only.`));
