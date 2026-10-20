@@ -46,9 +46,13 @@ async function main() {
   const group = await Conversation.create({ kind: 'group', name: 'Product delivery', members: [alice, bob, carol].map((person) => ({ user: person._id })), createdBy: alice._id, nextSequence: 1 });
   await Message.create({ conversation: group._id, sender: carol._id, sequence: 1, clientId: 'qa-group-message', text: 'Welcome to our delivery team chat. Share updates here.', readBy: [carol._id] });
   const app = express();
-  app.use(cors({ origin: 'http://127.0.0.1:3001' })); app.use(express.json());
+  app.use(cors({ origin: process.env.QA_ORIGIN || 'http://127.0.0.1:3001' })); app.use(express.json());
   const profile = (person) => ({ id: String(person._id), name: person.name, role: person.role, email: person.email, department: person.department, designation: 'QA Fixture' });
-  app.post('/api/auth/login', (req, res) => res.json({ success: true, token: jwt.sign({ id: alice._id }, process.env.JWT_SECRET), user: profile(alice) }));
+  app.post('/api/auth/login', (req, res) => {
+    const person = [alice, bob, carol].find(user => user.email === req.body.email);
+    if (!person || req.body.password !== 'chat-qa-only') return res.status(401).json({ success: false, message: 'Invalid QA credentials' });
+    res.json({ success: true, token: jwt.sign({ id: person._id }, process.env.JWT_SECRET), user: profile(person) });
+  });
   app.get('/api/auth/me', protect, (req, res) => res.json({ success: true, user: profile(req.user) }));
   app.get('/api/auth/users', (req, res) => res.json({ success: true, users: [alice, bob, carol].map(profile) }));
   app.get('/api/projects', (req, res) => res.json({ success: true, projects: [] }));
@@ -57,7 +61,7 @@ async function main() {
   app.use('/api/chat', require('../src/routes/chatRoutes'));
   app.use((error, req, res, next) => res.status(error.status || 500).json({ success: false, message: error.message }));
   realtime = require('../src/services/realtime').createRealtimeServer(app, { pollInterval: 100 });
-  server = realtime.server.listen(4011, '127.0.0.1', () => console.log('Temporary chat QA API on http://127.0.0.1:4011. Sign in with chat-qa-0@example.test / chat-qa-only.'));
+  server = realtime.server.listen(Number(process.env.QA_PORT || 4011), '127.0.0.1', () => console.log(`Temporary chat QA API on port ${server.address().port}. Synthetic accounts only.`));
   process.on('SIGINT', () => void cleanup().then(() => process.exit()));
   process.on('SIGTERM', () => void cleanup().then(() => process.exit()));
 }

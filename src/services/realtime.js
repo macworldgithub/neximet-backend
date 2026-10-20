@@ -20,6 +20,7 @@ function createRealtimeServer(app, { pollInterval = 1000, config = runtimeConfig
     pingTimeout: 20000,
   });
   let startup, stream, pollTimer, closed = false;
+  const calls = require('./calls').createCallService(io);
   const received = new Map();
   let fanout = Promise.resolve();
   const dispatch = (event) => {
@@ -90,6 +91,7 @@ function createRealtimeServer(app, { pollInterval = 1000, config = runtimeConfig
     } catch (error) { next(new Error(error.message || 'Chat connection failed')); }
   });
   io.on('connection', (socket) => {
+    calls.attach(socket);
     let windowStart = Date.now(), requests = 0;
     const expires = Number.isFinite(socket.data.expiresAt) ? setTimeout(() => socket.disconnect(true), Math.min(socket.data.expiresAt - Date.now(), 2147483647)) : null;
     expires?.unref();

@@ -14,6 +14,7 @@
     "test:production": "node --experimental-require-module --test test/production.test.js",
     "test:proxy": "node --test test/deployment-proxy.test.js",
     "test:chat": "node --test test/chat.test.js",
+    "test:calls": "node --test test/calls.test.js",
     "test:mail": "node --test test/mail.test.js test/mail-runtime.test.js",
     "test:ai": "node --test test/ai.test.js test/ai-integration.test.js",
     "test:attendance": "node --test test/attendance-policy.test.js test/attendance.test.js",
