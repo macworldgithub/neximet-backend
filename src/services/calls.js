@@ -4,6 +4,10 @@ const User = require('../models/User');
 const Meeting = require('../models/Meeting');
 const CallSession = require('../models/CallSession');
 const records = require('./meetingRecords');
+const { invitees } = require('./meetingInvites');
+const notifications = require('./meetingNotifications');
+const notifyCall = (room, users, expiresAt) => notifications.notifyCall(room.id, users.map(id => id.replace(/^user:/, '')), expiresAt)
+  .catch(error => console.warn('Call push deferred:', error.message));
 
 const MAX_PARTICIPANTS = 8;
 const validId = (id) => typeof id === 'string' && /^[a-f\d]{24}$/i.test(id);
@@ -39,7 +43,7 @@ function createCallService(io) {
   }, 30000);
   heartbeat.unref();
   const snapshot = room => ({ id: room.id, conversationId: room.conversationId, title: room.title,
-    meetingId: room.meetingId || undefined, mode: room.mode, hostId: room.hostId, startedAt: room.startedAt, participants: [...room.participants.values()] });
+    meetingId: room.meetingId || undefined, mode: room.mode, hostId: room.hostId, startedAt: room.startedAt, participants: [...room.participants.values()], invitedUserIds: room.inviteUsers.map(id => id.slice(5)) });
   const broadcast = room => io.to(`call:${room.id}`).emit('call:updated', snapshot(room));
   async function leave(socket) {
     const room = rooms.get(socket.data.callConversation);
@@ -79,14 +83,16 @@ function createCallService(io) {
           if (event !== 'call:config') {
             if (!validId(payload.conversationId)) throw new Error('Invalid conversation');
             payload.conversationId = payload.conversationId.toLowerCase();
-            conversation = await Conversation.findOne({ _id: payload.conversationId, 'members.user': user._id });
-            if (!conversation) throw new Error('Conversation not found');
+            conversation = await Conversation.findById(payload.conversationId);
+            const invited = rooms.get(payload.conversationId)?.inviteUsers.includes(`user:${user._id}`);
+            if (!conversation || !invited && !conversation.members.some(member => String(member.user) === String(user._id))) throw new Error('Conversation not found');
           }
           // Database authorization awaits may race with disconnect.
           if (!socket.connected) return;
           const result = await serialize(payload.conversationId || socket.id, () => {
             if (closing) throw new Error('The server is restarting. Please rejoin shortly.');
             if (!socket.connected) throw new Error('The call disconnected');
+            if (conversation && !conversation.members.some(member => String(member.user) === String(user._id)) && !rooms.get(payload.conversationId)?.inviteUsers.includes(`user:${user._id}`)) throw new Error('This invitation is no longer active');
             return handler(payload, user, conversation);
           });
           ack({ success: true, ...result });
@@ -100,7 +106,8 @@ function createCallService(io) {
       let room = rooms.get(payload.conversationId);
       if (payload.callId && room?.id !== payload.callId) throw new Error('This call has ended');
       if (payload.meetingId && (!validId(payload.meetingId) || room && room.meetingId !== payload.meetingId)) throw new Error('A different meeting is already running in this conversation');
-      const meetingId = room?.meetingId || payload.meetingId;
+      const scheduledRoom = !room && !payload.meetingId && conversation.purpose === 'meeting' ? await Meeting.findOne({ conversation: conversation._id }).select('_id') : null;
+      const meetingId = room?.meetingId || payload.meetingId || (scheduledRoom ? String(scheduledRoom._id) : null);
       let meeting;
       if (meetingId) {
         meeting = await Meeting.findOne({ _id: meetingId, conversation: conversation._id, participants: user._id });
@@ -140,8 +147,12 @@ function createCallService(io) {
       socket.data.callConversation = payload.conversationId;
       socket.join(`call:${room.id}`);
       broadcast(room);
-      if (created) io.to(room.inviteUsers.filter(id => id !== `user:${socket.data.userId}`))
-        .emit('call:incoming', { ...snapshot(room), callerName: user.name, expiresAt: Date.now() + 45000 });
+      if (created) {
+        const users = room.inviteUsers.filter(id => id !== `user:${socket.data.userId}`), expiresAt = Date.now() + 45000;
+        io.to(users).emit('call:incoming', { ...snapshot(room), callerName: user.name, expiresAt });
+        await notifyCall(room, users, expiresAt);
+      }
+      io.to(`user:${socket.data.userId}`).emit('call:dismissed', { callId: room.id });
       return { call: snapshot(room) };
     });
     const joined = payload => {
@@ -168,6 +179,24 @@ function createCallService(io) {
       for (const key of ['microphone', 'camera', 'sharing', 'handRaised']) if (typeof payload[key] === 'boolean') participant[key] = payload[key];
       broadcast(room); return {};
     });
+    command('call:invite', async (payload, user, conversation) => {
+      const room = joined(payload);
+      if (room.hostId !== socket.data.userId) throw new Error('Only the host can invite people');
+      const selected = await invitees(payload.participantIds, user._id);
+      const added = selected.filter(id => !room.inviteUsers.includes(`user:${id}`));
+      if (room.inviteUsers.length + added.length > MAX_PARTICIPANTS) throw new Error('Meetings support up to 8 invited people');
+      if (!added.length) return {};
+      await CallSession.updateOne({ callId: room.id, endedAt: null }, { $addToSet: { invitedUsers: { $each: added } } });
+      if (room.meetingId) await Meeting.updateOne({ _id: room.meetingId, activeCallId: room.id }, { $addToSet: { participants: { $each: added } }, $inc: { __v: 1 } });
+      if (conversation.purpose === 'meeting') await Conversation.updateOne({ _id: conversation._id }, { $addToSet: { members: { $each: added.map(id => ({ user: id })) } } });
+      const destinations = added.map(id => `user:${id}`);
+      room.inviteUsers.push(...destinations);
+      broadcast(room);
+      const expiresAt = Date.now() + 45000;
+      io.to(destinations).emit('call:incoming', { ...snapshot(room), callerName: user.name, expiresAt });
+      await notifyCall(room, destinations, expiresAt);
+      return {};
+    });
     command('call:leave', async payload => { joined(payload); await leave(socket); return {}; });
     command('call:end', async payload => {
       const room = joined(payload);
@@ -185,6 +214,7 @@ function createCallService(io) {
       if (room?.id === payload.callId) {
         await CallSession.updateOne({ callId: room.id }, { $addToSet: { declinedBy: user._id } });
         io.to(`call:${room.id}`).emit('call:declined', { callId: room.id, name: user.name });
+        io.to(`user:${socket.data.userId}`).emit('call:dismissed', { callId: room.id });
       }
       return {};
     });

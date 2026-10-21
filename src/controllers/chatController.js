@@ -31,7 +31,7 @@ exports.getPeople = wrap(async (req, res) => {
 
 exports.listConversations = wrap(async (req, res) => {
   const conversations = await Conversation.aggregate([
-    { $match: { 'members.user': req.user._id } },
+    { $match: { 'members.user': req.user._id, purpose: { $ne: 'meeting' } } },
     { $sort: { lastActivityAt: -1, _id: -1 } },
     { $lookup: { from: Message.collection.name, let: { chat: '$_id' }, pipeline: [
       { $match: { readBy: { $ne: req.user._id }, $expr: { $and: [{ $eq: ['$conversation', '$$chat'] }, { $ne: ['$sender', req.user._id] }] } } },

@@ -11,7 +11,9 @@ const schema = new mongoose.Schema({
   mode: { type: String, enum: ['audio', 'video'], default: 'video' },
   status: { type: String, enum: ['scheduled', 'in_progress', 'completed', 'cancelled'], default: 'scheduled' },
   activeCallId: { type: String, default: null },
+  notificationRevision: { type: Number, default: 0 },
   responses: [{ user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, response: { type: String, enum: ['accepted', 'declined', 'tentative'] }, _id: false }],
 }, { timestamps: true, optimisticConcurrency: true });
 schema.index({ participants: 1, startsAt: 1 });
+schema.index({ status: 1, startsAt: 1 });
 module.exports = mongoose.model('Meeting', schema);

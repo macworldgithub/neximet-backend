@@ -19,8 +19,10 @@ function createRealtimeServer(app, { pollInterval = 1000, config = runtimeConfig
     pingInterval: 20000,
     pingTimeout: 20000,
   });
-  let startup, stream, pollTimer, closed = false;
+  let startup, stream, pollTimer, stopMeetingNotifications, closed = false;
   const calls = require('./calls').createCallService(io);
+  server.on('listening', () => { stopMeetingNotifications = require('./meetingNotifications').start(); });
+  const closeCalls = async () => { await calls.close(); await stopMeetingNotifications?.(); };
   const received = new Map();
   let fanout = Promise.resolve();
   const dispatch = (event) => {
@@ -116,11 +118,11 @@ function createRealtimeServer(app, { pollInterval = 1000, config = runtimeConfig
     socket.on('disconnect', () => { if (expires) clearTimeout(expires); });
   });
   server.on('close', () => {
-    void calls.close().catch(error => console.warn('Meeting shutdown cleanup failed:', error.message));
+    void closeCalls().catch(error => console.warn('Meeting shutdown cleanup failed:', error.message));
     closed = true;
     if (pollTimer) clearInterval(pollTimer);
     if (stream) void stream.close().catch(() => {});
   });
-  return { server, io, closeCalls: calls.close };
+  return { server, io, closeCalls };
 }
 module.exports = { createRealtimeServer };

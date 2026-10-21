@@ -7,6 +7,7 @@ const memberSchema = new mongoose.Schema({
 
 const schema = new mongoose.Schema({
   kind: { type: String, enum: ['direct', 'group'], required: true },
+  purpose: { type: String, enum: ['chat', 'meeting'], default: 'chat' },
   name: { type: String, trim: true, maxlength: 80 },
   // A canonical pair prevents duplicate direct chats, including concurrent creation.
   directKey: { type: String },

@@ -8,6 +8,7 @@ async function finish(callId, reason = 'everyone_left', at = new Date()) {
   if (session?.meeting) await Meeting.updateOne({ _id: session.meeting, activeCallId: callId }, {
     $set: { status: 'completed', activeCallId: null },
   });
+  if (session) await require('./meetingNotifications').notifyCallEnded(session).catch(error => console.warn('Call-ended notification deferred:', error.message));
 }
 async function reconcile() {
   const stale = await CallSession.find({ endedAt: null, lastSeenAt: { $lt: new Date(Date.now() - 120000) } }).select('callId lastSeenAt').limit(100).lean();

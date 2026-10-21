@@ -10,6 +10,24 @@ const { verifyDatabase, startServer } = require('../src/lifecycle');
 const { prepare } = require('../scripts/setup-production-env');
 const dotenv = require('dotenv');
 
+test('Web Push setup preserves an existing key pair and fills a missing subject without exposing private values', () => {
+  const source = require('node:fs').readFileSync(require('node:path').join(__dirname, '../scripts/configure-web-push.js'), 'utf8');
+  for (const initial of ['', 'WEB_PUSH_VAPID_PUBLIC_KEY=existing-public\nWEB_PUSH_VAPID_PRIVATE_KEY=existing-private\n', 'WEB_PUSH_VAPID_PUBLIC_KEY=existing-public\nWEB_PUSH_VAPID_PRIVATE_KEY=existing-private\nWEB_PUSH_SUBJECT=https://custom.test\n']) {
+    let contents = initial, generated = 0; const messages = [];
+    require('node:vm').runInNewContext(source, { __dirname: '/isolated/backend/scripts', console: { log: message => messages.push(message) }, require: name => {
+      if (name === 'fs' || name === 'node:fs') return { existsSync: () => true, readFileSync: () => contents, writeFileSync: (file, value) => { contents = value; }, appendFileSync: (file, value) => { contents += value; } };
+      if (name === 'web-push') return { generateVAPIDKeys: () => { generated++; return { publicKey: 'new-public', privateKey: 'new-private' }; } };
+      if (['path', 'node:path', 'dotenv'].includes(name)) return require(name);
+      throw new Error(`Unexpected setup dependency: ${name}`);
+    } });
+    const result = dotenv.parse(contents);
+    assert.equal(result.WEB_PUSH_VAPID_PRIVATE_KEY, initial ? 'existing-private' : 'new-private');
+    assert.equal(generated, initial ? 0 : 1); assert.ok(result.WEB_PUSH_SUBJECT);
+    if (initial.includes('custom.test')) assert.equal(result.WEB_PUSH_SUBJECT, 'https://custom.test');
+    assert.equal(messages.some(message => message.includes(result.WEB_PUSH_VAPID_PRIVATE_KEY)), false);
+  }
+});
+
 const environment = () => ({ NODE_ENV: 'production', MONGODB_URI: 'mongodb://127.0.0.1:27017/isolated?replicaSet=test', JWT_SECRET: 'a'.repeat(64), MAIL_ENCRYPTION_KEY: 'b'.repeat(64) });
 async function listen(t, app) {
   const server = app.listen(0, '127.0.0.1'); await once(server, 'listening');

@@ -5,6 +5,9 @@ const CallSession = require('../models/CallSession');
 const Conversation = require('../models/Conversation');
 const User = require('../models/User');
 const { reconcile } = require('../services/meetingRecords');
+const { invitees, createRoom } = require('../services/meetingInvites');
+const notifications = require('../services/meetingNotifications');
+const notify = (meeting, kind) => notifications.notifyMeeting(meeting, kind).catch(error => console.warn('Meeting invitation notification deferred:', error.message));
 const validId = id => typeof id === 'string' && /^[a-f\d]{24}$/i.test(id);
 const fail = (status, message) => Object.assign(new Error(message), { status });
 const wrap = handler => async (req, res, next) => { try { await handler(req, res); } catch (error) { next(error.name === 'VersionError' ? fail(409, 'The meeting changed. Refresh and try again.') : error); } };
@@ -28,6 +31,20 @@ function fields(body) {
   if (+startsAt < Date.now() - 60000) throw fail(400, 'Choose a future start time');
   return { title: body.title.trim(), description: body.description || '', startsAt, endsAt, timezone: body.timezone, mode: body.mode };
 }
+router.post('/rooms', wrap(async (req, res) => {
+  const participants = await invitees(req.body.participantIds, req.user._id);
+  if (req.body.title !== undefined && (typeof req.body.title !== 'string' || req.body.title.trim().length > 120)) throw fail(400, 'Enter a title of at most 120 characters');
+  const room = await createRoom(req.user._id, participants, req.body.title?.trim() || 'Team meeting');
+  res.status(201).json({ success: true, room: await room.populate('members.user', 'name') });
+}));
+router.get('/rooms/:id', wrap(async (req, res) => {
+  if (!validId(req.params.id)) throw fail(400, 'Invalid meeting room');
+  const room = await Conversation.findById(req.params.id).populate('members.user', 'name');
+  if (!room) throw fail(404, 'Meeting room not found');
+  const member = room.members.some(item => String(item.user?._id) === String(req.user._id));
+  if (!member && !await CallSession.exists({ conversation: room._id, endedAt: null, invitedUsers: req.user._id, lastSeenAt: { $gte: new Date(Date.now() - 120000) } })) throw fail(404, 'Meeting room not found');
+  res.json({ success: true, room });
+}));
 router.get('/history', wrap(async (req, res) => {
   await reconcile();
   const query = { invitedUsers: req.user._id };
@@ -71,13 +88,19 @@ router.get('/', wrap(async (req, res) => {
 }));
 router.post('/', wrap(async (req, res) => {
   const data = fields(req.body);
-  if (!validId(req.body.conversationId)) throw fail(400, 'Choose a conversation');
-  const conversation = await Conversation.findOne({ _id: req.body.conversationId, 'members.user': req.user._id });
-  if (!conversation) throw fail(404, 'Conversation not found');
-  const ids = conversation.members.map(member => member.user);
-  const participants = await User.find({ _id: { $in: ids }, isActive: true }).distinct('_id');
+  let conversation, participants;
+  if (req.body.participantIds !== undefined) {
+    participants = await invitees(req.body.participantIds, req.user._id);
+    conversation = await createRoom(req.user._id, participants, data.title);
+  } else {
+    if (!validId(req.body.conversationId)) throw fail(400, 'Choose participants or a conversation');
+    conversation = await Conversation.findOne({ _id: req.body.conversationId, 'members.user': req.user._id });
+    if (!conversation) throw fail(404, 'Conversation not found');
+    participants = await User.find({ _id: { $in: conversation.members.map(member => member.user) }, isActive: true }).distinct('_id');
+  }
   const meeting = await Meeting.create({ ...data, conversation: conversation._id, organizer: req.user._id, participants,
     responses: [{ user: req.user._id, response: 'accepted' }] });
+  await notify(meeting, 'meeting_invitation');
   res.status(201).json({ success: true, meeting: await populate(meeting) });
 }));
 router.get('/:id', wrap(async (req, res) => res.json({ success: true, meeting: await populate(await findMeeting(req)) })));
@@ -86,15 +109,28 @@ router.patch('/:id', wrap(async (req, res) => {
   if (String(meeting.organizer) !== String(req.user._id)) throw fail(403, 'Only the organizer can edit this meeting');
   if (meeting.status !== 'scheduled') throw fail(409, 'Only scheduled meetings can be edited');
   Object.assign(meeting, fields(req.body));
+  let managedRoom;
+  if (req.body.participantIds !== undefined) {
+    const participants = await invitees(req.body.participantIds, req.user._id);
+    managedRoom = await Conversation.findOne({ _id: meeting.conversation, purpose: 'meeting' });
+    // Legacy conversation invitations become a private room without changing a chat.
+    if (!managedRoom) managedRoom = await createRoom(req.user._id, participants, meeting.title);
+    meeting.conversation = managedRoom._id; meeting.participants = participants;
+  }
   // Changes to the invitation require attendees to confirm again.
   meeting.responses = [{ user: req.user._id, response: 'accepted' }];
-  await meeting.save(); res.json({ success: true, meeting: await populate(meeting) });
+  meeting.notificationRevision = (meeting.notificationRevision || 0) + 1;
+  await meeting.save();
+  if (managedRoom) await Conversation.updateOne({ _id: managedRoom._id }, { $set: { name: meeting.title.slice(0, 80), members: meeting.participants.map(user => ({ user })) } });
+  await notify(meeting, 'meeting_updated');
+  res.json({ success: true, meeting: await populate(meeting) });
 }));
 router.post('/:id/cancel', wrap(async (req, res) => {
   const meeting = await findMeeting(req);
   if (String(meeting.organizer) !== String(req.user._id)) throw fail(403, 'Only the organizer can cancel this meeting');
   if (meeting.status !== 'scheduled') throw fail(409, 'Only scheduled meetings can be cancelled');
-  meeting.status = 'cancelled'; await meeting.save();
+  meeting.status = 'cancelled'; meeting.notificationRevision = (meeting.notificationRevision || 0) + 1; await meeting.save();
+  await notify(meeting, 'meeting_cancelled');
   res.json({ success: true, meeting: await populate(meeting) });
 }));
 router.post('/:id/rsvp', wrap(async (req, res) => {

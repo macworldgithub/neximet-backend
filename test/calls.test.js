@@ -249,6 +249,152 @@ test('history pagination is private and returns older records without duplicates
   assert.equal((await request(0, '/history?q[x]=object')).status, 400);
 });
 
+test('standalone meetings invite users without existing chats and hosts can add live guests', async () => {
+  assert.equal((await request(null, '/rooms', { participantIds: [] })).status, 401);
+  for (const participantIds of ['invalid', ['bad'], users.slice(1, 10).map(user => String(user._id))]) assert.equal((await request(0, '/rooms', { participantIds })).status, 400);
+  const created = await request(0, '/rooms', { title: 'Open team voice meeting', participantIds: [String(users[10]._id)] });
+  assert.equal(created.status, 201); assert.equal(created.body.room.purpose, 'meeting');
+  const room = created.body.room;
+  assert.equal((await request(10, `/rooms/${room._id}`)).status, 200);
+  assert.equal((await request(2, `/rooms/${room._id}`)).status, 404);
+  const [host, invited, extra] = await Promise.all([connect(0), connect(10), connect(2)]);
+  const ringing = event(invited, 'call:incoming');
+  const started = await join(host, room, { mode: 'audio', camera: false });
+  assert.equal((await ringing).mode, 'audio'); assert.equal(started.call.participants[0].camera, false);
+  assert.equal((await join(invited, room, { mode: 'audio', camera: false })).success, true);
+  const payload = { conversationId: room._id, callId: started.call.id };
+  assert.equal((await command(invited, 'call:invite', { ...payload, participantIds: [String(users[2]._id)] })).success, false);
+  const additionalRing = event(extra, 'call:incoming');
+  assert.equal((await command(host, 'call:invite', { ...payload, participantIds: [String(users[2]._id)] })).success, true);
+  assert.equal((await additionalRing).id, started.call.id);
+  assert.equal((await request(2, `/rooms/${room._id}`)).status, 200);
+  assert.equal((await join(extra, room, { mode: 'audio', camera: false })).success, true);
+  await command(host, 'call:end', payload);
+  const stored = await CallSession.findOne({ callId: started.call.id });
+  assert.equal(stored.invitedUsers.length, 3); assert.equal(stored.attendance.length, 3);
+  for (const client of [host, invited, extra]) client.disconnect();
+});
+
+test('chat-call guests can join only the active invitation without acquiring chat membership', async () => {
+  const [host, guest] = await Promise.all([connect(0), connect(10)]);
+  const started = await join(host, direct, { mode: 'audio', camera: false });
+  const payload = { conversationId: String(direct._id), callId: started.call.id };
+  const ringing = event(guest, 'call:incoming');
+  assert.equal((await command(host, 'call:invite', { ...payload, participantIds: [String(users[10]._id)] })).success, true);
+  await ringing;
+  assert.equal((await request(10, `/rooms/${direct._id}`)).status, 200);
+  assert.equal((await join(guest, direct, { callId: started.call.id, mode: 'audio', camera: false })).success, true);
+  assert.equal((await Conversation.findById(direct._id)).members.length, 2);
+  await command(host, 'call:end', payload);
+  assert.equal((await join(guest, direct)).success, false);
+  assert.equal((await request(10, `/rooms/${direct._id}`)).status, 404);
+  host.disconnect(); guest.disconnect();
+});
+
+test('multi-user schedules persist selected guests, allow edits, and enforce the window without a meeting ID', async () => {
+  const data = { ...schedule(60), conversationId: undefined, participantIds: [String(users[10]._id), String(users[2]._id)] };
+  const created = await request(0, '', data); assert.equal(created.status, 201);
+  const meeting = created.body.meeting; assert.equal(meeting.participants.length, 3);
+  assert.equal((await request(10, `/${meeting._id}`)).status, 200);
+  assert.equal((await request(1, `/${meeting._id}`)).status, 404);
+  const host = await connect(0); const room = { _id: meeting.conversation };
+  assert.equal((await join(host, room)).success, false);
+  const edited = await request(0, `/${meeting._id}`, { ...data, participantIds: [String(users[1]._id)] }, 'PATCH');
+  assert.equal(edited.status, 200); assert.equal(edited.body.meeting.conversation, meeting.conversation);
+  assert.equal((await request(10, `/${meeting._id}`)).status, 404);
+  assert.equal((await request(10, `/rooms/${meeting.conversation}`)).status, 404);
+  assert.equal((await request(1, `/${meeting._id}`)).status, 200);
+  assert.equal((await request(10, `/${meeting._id}`, data, 'PATCH')).status, 404);
+  const inactive = users[3]; await User.updateOne({ _id: inactive._id }, { isActive: false });
+  assert.equal((await request(0, '/rooms', { participantIds: [String(inactive._id)] })).status, 400);
+  await User.updateOne({ _id: inactive._id }, { isActive: true });
+  assert.equal((await request(0, `/${meeting._id}/cancel`, {})).status, 200);
+  assert.equal((await join(host, room)).success, false);
+  host.disconnect();
+});
+
+test('call push reaches offline invitees, deduplicates, and replaces ringing with call-ended status', async () => {
+  const webpush = require('web-push'), notifications = require('../src/services/meetingNotifications');
+  const Subscription = require('../src/models/PushSubscription'), Job = require('../src/models/MeetingPushJob');
+  const keys = webpush.generateVAPIDKeys(), original = webpush.sendNotification;
+  const names = ['WEB_PUSH_VAPID_PUBLIC_KEY', 'WEB_PUSH_VAPID_PRIVATE_KEY', 'WEB_PUSH_SUBJECT'];
+  const previous = names.map(name => process.env[name]);
+  Object.assign(process.env, { WEB_PUSH_VAPID_PUBLIC_KEY: keys.publicKey, WEB_PUSH_VAPID_PRIVATE_KEY: keys.privateKey, WEB_PUSH_SUBJECT: 'https://example.test' });
+  const sent = []; webpush.sendNotification = async (subscription, payload, options) => { sent.push({ endpoint: subscription.endpoint, ...JSON.parse(payload), options }); };
+  const host = await connect(0);
+  try {
+    await Subscription.create({ user: users[10]._id, endpoint: 'https://fcm.googleapis.com/call-test-offline', keys: { p256dh: 'fixture', auth: 'fixture' } });
+    const room = (await request(0, '/rooms', { participantIds: [String(users[10]._id)] })).body.room;
+    const started = await join(host, room, { mode: 'audio', camera: false }); assert.equal(started.success, true);
+    await notifications.flush();
+    let alerts = sent.filter(item => item.callId === started.call.id && item.kind === 'incoming_call');
+    assert.equal(alerts.length, 1); assert.equal(alerts[0].userId, String(users[10]._id));
+    assert.equal(alerts[0].options.urgency, 'high'); assert.ok(alerts[0].options.TTL <= 45);
+    assert.ok(alerts[0].url.includes('mode=audio')); assert.equal(alerts[0].receiptToken, undefined);
+    await notifications.notifyCall(started.call.id, [users[10]._id], Date.now() + 45000); await notifications.flush();
+    assert.equal(sent.filter(item => item.callId === started.call.id && item.kind === 'incoming_call').length, 1);
+    const payload = { conversationId: room._id, callId: started.call.id };
+    await command(host, 'call:end', payload); await notifications.flush();
+    alerts = sent.filter(item => item.callId === started.call.id && item.kind === 'call_ended');
+    assert.equal(alerts.length, 1); assert.equal(alerts[0].title, 'Missed voice call');
+    assert.equal(await Job.countDocuments({ key: `call:${started.call.id}`, status: 'sent' }), 1);
+  } finally {
+    host.disconnect(); await notifications.flush(); await Subscription.deleteMany({});
+    names.forEach((name, index) => { if (previous[index] === undefined) delete process.env[name]; else process.env[name] = previous[index]; });
+    webpush.sendNotification = original;
+  }
+});
+
+test('meeting pushes and durable reminders respect RSVP, edits, retries, cancellation and device ownership', async () => {
+  const webpush = require('web-push'), notifications = require('../src/services/meetingNotifications');
+  const Subscription = require('../src/models/PushSubscription'), Job = require('../src/models/MeetingPushJob');
+  const keys = webpush.generateVAPIDKeys(), original = webpush.sendNotification;
+  const names = ['WEB_PUSH_VAPID_PUBLIC_KEY', 'WEB_PUSH_VAPID_PRIVATE_KEY', 'WEB_PUSH_SUBJECT'], previous = names.map(name => process.env[name]);
+  Object.assign(process.env, { WEB_PUSH_VAPID_PUBLIC_KEY: keys.publicKey, WEB_PUSH_VAPID_PRIVATE_KEY: keys.privateKey, WEB_PUSH_SUBJECT: 'https://example.test' });
+  const sent = []; let failing = false;
+  webpush.sendNotification = async (target, data) => { if (failing && target.endpoint.endsWith('device-1')) throw Object.assign(new Error('Retry'), { statusCode: 503 }); sent.push(JSON.parse(data)); };
+  try {
+    for (const index of [0, 1, 2]) await Subscription.create({ user: users[index]._id, endpoint: `https://fcm.googleapis.com/device-${index}`, keys: { p256dh: 'fixture', auth: 'fixture' } });
+    const created = await request(0, '', { ...schedule(30), conversationId: undefined, participantIds: [String(users[1]._id), String(users[2]._id)] });
+    assert.equal(created.status, 201); const id = created.body.meeting._id;
+    await notifications.flush();
+    assert.equal(sent.filter(item => item.meetingId === id && item.kind === 'meeting_invitation').length, 2);
+    await request(2, `/${id}/rsvp`, { response: 'declined' });
+    await Meeting.updateOne({ _id: id }, { $set: { startsAt: new Date(Date.now() + 540000) } });
+    await notifications.flush(); await notifications.flush();
+    let reminders = sent.filter(item => item.meetingId === id && item.kind === 'meeting_reminder');
+    assert.equal(reminders.length, 2); assert.ok(!reminders.some(item => item.userId === String(users[2]._id)));
+    await Meeting.updateOne({ _id: id }, { $set: { startsAt: new Date(Date.now() - 1000) } }); await notifications.flush();
+    assert.equal(sent.filter(item => item.meetingId === id && item.kind === 'meeting_starting').length, 2);
+    await request(0, `/${id}/cancel`, {}); await notifications.flush();
+    assert.equal(sent.filter(item => item.meetingId === id && item.kind === 'meeting_cancelled').length, 2);
+    const count = sent.filter(item => item.meetingId === id).length; await notifications.flush();
+    assert.equal(sent.filter(item => item.meetingId === id).length, count);
+    failing = true;
+    const retry = (await request(0, '', { ...schedule(60), conversationId: undefined, participantIds: [String(users[1]._id)] })).body.meeting;
+    await notifications.flush();
+    const job = await Job.findOne({ meeting: retry._id, kind: 'meeting_invitation' });
+    assert.equal(job.status, 'pending'); assert.equal(job.attempts, 1);
+    await notifications.flush(); assert.equal((await Job.findById(job._id)).attempts, 1);
+    failing = false; await Job.updateOne({ _id: job._id }, { nextAttemptAt: new Date(0) });
+    await Promise.all([notifications.flush(), notifications.flush()]);
+    assert.equal(sent.filter(item => item.meetingId === retry._id).length, 1);
+    failing = true;
+    await request(0, `/${retry._id}`, { ...schedule(90), participantIds: [String(users[1]._id)], title: 'Changed meeting' }, 'PATCH'); await notifications.flush();
+    const update = await Job.findOne({ meeting: retry._id, kind: 'meeting_updated' }); assert.equal(update.status, 'pending');
+    await Subscription.updateOne({ user: users[1]._id }, { user: users[10]._id }); failing = false;
+    await Job.updateOne({ _id: update._id }, { nextAttemptAt: new Date(0) }); await notifications.flush();
+    assert.equal(sent.some(item => item.meetingId === retry._id && item.kind === 'meeting_updated'), false);
+    // Outdated jobs are not delivered after a reschedule, even when retried later.
+    await Job.updateOne({ _id: job._id }, { status: 'pending', nextAttemptAt: new Date(0) }); await notifications.flush();
+    assert.equal(sent.filter(item => item.meetingId === retry._id && item.kind === 'meeting_invitation').length, 1);
+  } finally {
+    failing = false; await notifications.flush(); await Subscription.deleteMany({});
+    names.forEach((name, index) => { if (previous[index] === undefined) delete process.env[name]; else process.env[name] = previous[index]; });
+    webpush.sendNotification = original;
+  }
+});
+
 test('graceful shutdown closes attendance before the database disconnects', async () => {
   const alice = await connect(0);
   const started = await join(alice, direct);

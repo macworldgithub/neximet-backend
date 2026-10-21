@@ -40,7 +40,8 @@ async function main() {
     catch (error) { if (attempt === 39) throw error; await new Promise((resolve) => setTimeout(resolve, 200)); }
   }
   await Promise.all([User.init(), Conversation.init(), Message.init()]);
-  const [alice, bob, carol] = await User.create(['Alex Morgan', 'Sam Rivera', 'Jordan Lee'].map((name, index) => ({ name, email: `chat-qa-${index}@example.test`, password: 'chat-qa-only', department: 'Software Development', role: 'Team Member' })));
+  const fixtureUsers = await User.create(['Alex Morgan', 'Sam Rivera', 'Jordan Lee', 'Maya Patel'].map((name, index) => ({ name, email: `chat-qa-${index}@example.test`, password: 'chat-qa-only', department: 'Software Development', role: 'Team Member' })));
+  const [alice, bob, carol] = fixtureUsers;
   const direct = await Conversation.create({ kind: 'direct', directKey: [String(alice._id), String(bob._id)].sort().join(':'), members: [{ user: alice._id }, { user: bob._id }], createdBy: alice._id, nextSequence: 62 });
   await Message.insertMany(Array.from({ length: 62 }, (_, index) => ({ conversation: direct._id, sender: index % 2 ? alice._id : bob._id, sequence: index + 1, clientId: `qa-seed-${index}`, text: index === 61 ? 'The release checklist is ready. Can you review it today?' : `Project update ${index + 1}: the team is making good progress.`, readBy: [bob._id], createdAt: new Date(Date.now() - (62 - index) * 60000) })));
   const group = await Conversation.create({ kind: 'group', name: 'Product delivery', members: [alice, bob, carol].map((person) => ({ user: person._id })), createdBy: alice._id, nextSequence: 1 });
@@ -49,12 +50,12 @@ async function main() {
   app.use(cors({ origin: process.env.QA_ORIGIN || 'http://127.0.0.1:3001' })); app.use(express.json());
   const profile = (person) => ({ id: String(person._id), name: person.name, role: person.role, email: person.email, department: person.department, designation: 'QA Fixture' });
   app.post('/api/auth/login', (req, res) => {
-    const person = [alice, bob, carol].find(user => user.email === req.body.email);
+    const person = fixtureUsers.find(user => user.email === req.body.email);
     if (!person || req.body.password !== 'chat-qa-only') return res.status(401).json({ success: false, message: 'Invalid QA credentials' });
     res.json({ success: true, token: jwt.sign({ id: person._id }, process.env.JWT_SECRET), user: profile(person) });
   });
   app.get('/api/auth/me', protect, (req, res) => res.json({ success: true, user: profile(req.user) }));
-  app.get('/api/auth/users', (req, res) => res.json({ success: true, users: [alice, bob, carol].map(profile) }));
+  app.get('/api/auth/users', (req, res) => res.json({ success: true, users: fixtureUsers.map(profile) }));
   app.get('/api/projects', (req, res) => res.json({ success: true, projects: [] }));
   app.get('/api/attendance/today', (req, res) => res.json({ success: true, attendance: null }));
   app.get('/api/leaves/summary', (req, res) => res.json({ success: true, totalHolidaysLeft: 32 }));
