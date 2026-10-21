@@ -8,7 +8,7 @@ const User = require('../models/User');
 const ChatEvent = require('../models/ChatEvent');
 const { corsOptions, originAllowed, runtimeConfig } = require('../config/runtime');
 
-function createRealtimeServer(app, { pollInterval = 1000, config = runtimeConfig() } = {}) {
+function createRealtimeServer(app, { pollInterval = 1000, config = runtimeConfig(), callRingTimeoutMs = 45000 } = {}) {
   const server = createServer(app);
   const io = new Server(server, {
     path: '/api/socket.io',
@@ -20,7 +20,7 @@ function createRealtimeServer(app, { pollInterval = 1000, config = runtimeConfig
     pingTimeout: 20000,
   });
   let startup, stream, pollTimer, stopMeetingNotifications, closed = false;
-  const calls = require('./calls').createCallService(io);
+  const calls = require('./calls').createCallService(io, { ringTimeoutMs: callRingTimeoutMs });
   server.on('listening', () => { stopMeetingNotifications = require('./meetingNotifications').start(); });
   const closeCalls = async () => { await calls.close(); await stopMeetingNotifications?.(); };
   const received = new Map();

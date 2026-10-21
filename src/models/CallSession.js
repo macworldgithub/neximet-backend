@@ -8,9 +8,10 @@ const schema = new mongoose.Schema({
   title: { type: String, required: true },
   mode: { type: String, enum: ['audio', 'video'], required: true },
   startedAt: { type: Date, required: true },
+  connectedAt: { type: Date, default: null },
   endedAt: { type: Date, default: null },
   lastSeenAt: { type: Date, required: true },
-  endReason: { type: String, enum: ['host_ended', 'everyone_left', 'server_disconnected'], default: null },
+  endReason: { type: String, enum: ['host_ended', 'everyone_left', 'server_disconnected', 'declined', 'no_answer', 'participant_left'], default: null },
   attendance: [{ user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }, joinedAt: { type: Date, required: true }, leftAt: { type: Date, default: null }, _id: false }],
   declinedBy: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
 }, { timestamps: true });

@@ -6,6 +6,7 @@ async function invitees(participantIds, organizer) {
     throw fail('Choose up to 7 participants (8 people including you)');
   }
   const ids = [...new Set([String(organizer), ...participantIds.map(id => id.toLowerCase())])];
+  if (ids.length < 2) throw fail('Add at least one other participant before starting or scheduling a meeting');
   if (ids.length > 8) throw fail('Meetings support up to 8 people');
   const active = await User.find({ _id: { $in: ids }, isActive: true }).distinct('_id');
   if (active.length !== ids.length) throw fail('One or more selected users are unavailable');

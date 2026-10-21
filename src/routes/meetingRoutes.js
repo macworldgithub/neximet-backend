@@ -65,7 +65,7 @@ router.get('/history', wrap(async (req, res) => {
     const seconds = (start, end) => Math.max(0, Math.floor((+new Date(end || Date.now()) - +new Date(start)) / 1000));
     return { ...session, durationSeconds: seconds(session.startedAt, session.endedAt),
       attendanceSeconds: mine.reduce((sum, item) => sum + seconds(item.joinedAt, item.leftAt || session.endedAt), 0),
-      outcome: mine.length ? session.endedAt ? attended.size === 1 && String(session.startedBy?._id) === String(req.user._id) && session.invitedUsers.length > 1 ? 'unanswered' : 'attended' : 'in_progress'
+      outcome: mine.length ? session.endedAt ? session.endReason === 'declined' ? 'declined' : attended.size === 1 && String(session.startedBy?._id) === String(req.user._id) && session.invitedUsers.length > 1 ? 'unanswered' : 'attended' : session.connectedAt || attended.size > 1 ? 'in_progress' : 'ringing'
         : session.declinedBy.some(id => String(id) === String(req.user._id)) ? 'declined' : session.endedAt ? 'missed' : 'invited' };
   });
   res.json({ success: true, history, hasMore });
@@ -97,6 +97,7 @@ router.post('/', wrap(async (req, res) => {
     conversation = await Conversation.findOne({ _id: req.body.conversationId, 'members.user': req.user._id });
     if (!conversation) throw fail(404, 'Conversation not found');
     participants = await User.find({ _id: { $in: conversation.members.map(member => member.user) }, isActive: true }).distinct('_id');
+    if (participants.length < 2) throw fail(400, 'Add at least one active participant');
   }
   const meeting = await Meeting.create({ ...data, conversation: conversation._id, organizer: req.user._id, participants,
     responses: [{ user: req.user._id, response: 'accepted' }] });

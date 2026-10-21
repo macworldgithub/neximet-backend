@@ -24,9 +24,10 @@ function iceConfiguration(userId, env = process.env) {
 
 // Calls are ephemeral and owned by the existing single VPS WebSocket process.
 // Never persist SDP/ICE: it contains private network information.
-function createCallService(io) {
+function createCallService(io, { ringTimeoutMs = 45000 } = {}) {
   const rooms = new Map();
   const pending = new Map();
+  const joiningUsers = new Map();
   const serialize = (key, task) => {
     const previous = pending.get(key) || Promise.resolve();
     const next = previous.catch(() => {}).then(task);
@@ -43,8 +44,33 @@ function createCallService(io) {
   }, 30000);
   heartbeat.unref();
   const snapshot = room => ({ id: room.id, conversationId: room.conversationId, title: room.title,
-    meetingId: room.meetingId || undefined, mode: room.mode, hostId: room.hostId, startedAt: room.startedAt, participants: [...room.participants.values()], invitedUserIds: room.inviteUsers.map(id => id.slice(5)) });
+    meetingId: room.meetingId || undefined, mode: room.mode, hostId: room.hostId, startedAt: room.startedAt, connectedAt: room.connectedAt,
+    phase: room.participants.size >= 2 ? 'connected' : room.connectedAt || room.meetingId ? 'waiting' : 'ringing',
+    oneToOne: room.oneToOne, ringUntil: room.ringUntil, participants: [...room.participants.values()], invitedUserIds: room.inviteUsers.map(id => id.slice(5)), invitedPeople: room.invitedPeople });
   const broadcast = room => io.to(`call:${room.id}`).emit('call:updated', snapshot(room));
+  async function endRoom(room, reason) {
+    if (rooms.get(room.conversationId) !== room) return;
+    clearTimeout(room.ringTimer);
+    try { await records.finish(room.id, reason); }
+    finally {
+      rooms.delete(room.conversationId);
+      io.to([`call:${room.id}`, ...room.inviteUsers]).emit('call:ended', { callId: room.id, reason });
+      for (const id of room.participants.keys()) {
+        const client = io.sockets.sockets.get(id);
+        if (client) { client.data.callConversation = null; client.leave(`call:${room.id}`); }
+      }
+    }
+  }
+  function ringTimeout(room) {
+    clearTimeout(room.ringTimer);
+    if (room.connectedAt || room.meetingId) return;
+    room.ringUntil = Date.now() + ringTimeoutMs;
+    room.ringTimer = setTimeout(() => {
+      void serialize(room.conversationId, () => room.participants.size < 2 ? endRoom(room, 'no_answer') : undefined)
+        .catch(error => console.warn('Call timeout cleanup failed:', error.message));
+    }, ringTimeoutMs);
+    room.ringTimer.unref();
+  }
   async function leave(socket) {
     const room = rooms.get(socket.data.callConversation);
     socket.data.callConversation = null;
@@ -55,11 +81,7 @@ function createCallService(io) {
       await CallSession.updateOne({ callId: room.id }, { $set: { 'attendance.$[mine].leftAt': leftAt } },
         { arrayFilters: [{ 'mine.user': socket.data.userId, 'mine.leftAt': null }] });
     } catch (error) { console.warn('Meeting attendance cleanup deferred:', error.message); }
-    if (!room.participants.size) {
-      io.to(room.inviteUsers).emit('call:ended', { callId: room.id });
-      rooms.delete(room.conversationId);
-      await records.finish(room.id, 'everyone_left', leftAt);
-    }
+    if (!room.participants.size || room.oneToOne && room.connectedAt) await endRoom(room, room.participants.size ? 'participant_left' : 'everyone_left');
     else {
       if (![...room.participants.values()].some(p => p.userId === room.hostId)) room.hostId = room.participants.values().next().value.userId;
       broadcast(room);
@@ -73,6 +95,7 @@ function createCallService(io) {
       if (Date.now() - windowStart > 10000) { windowStart = Date.now(); requests = 0; }
       if (++requests > 250) return ack({ success: false, message: 'Too many call requests. Try again shortly.' });
       queue = queue.then(async () => {
+        const previousCall = socket.data.callConversation;
         try {
           if (closing) throw new Error('The server is restarting. Please rejoin shortly.');
           if (!socket.connected || Date.now() >= socket.data.expiresAt) throw new Error('Your session has expired');
@@ -89,14 +112,27 @@ function createCallService(io) {
           }
           // Database authorization awaits may race with disconnect.
           if (!socket.connected) return;
-          const result = await serialize(payload.conversationId || socket.id, () => {
+          const work = () => serialize(payload.conversationId || socket.id, () => {
             if (closing) throw new Error('The server is restarting. Please rejoin shortly.');
             if (!socket.connected) throw new Error('The call disconnected');
             if (conversation && !conversation.members.some(member => String(member.user) === String(user._id)) && !rooms.get(payload.conversationId)?.inviteUsers.includes(`user:${user._id}`)) throw new Error('This invitation is no longer active');
             return handler(payload, user, conversation);
           });
+          let result;
+          if (event === 'call:join') {
+            const previous = joiningUsers.get(socket.data.userId) || Promise.resolve();
+            // Serialize call entry globally too: simultaneous calls in different
+            // rooms must not place either user into two calls or bypass busy checks.
+            const next = previous.catch(() => {}).then(() => serialize('__call_join__', work)); joiningUsers.set(socket.data.userId, next);
+            try { result = await next; } finally { if (joiningUsers.get(socket.data.userId) === next) joiningUsers.delete(socket.data.userId); }
+          } else result = await work();
           ack({ success: true, ...result });
-        } catch (error) { ack({ success: false, message: error.message || 'Call request failed' }); }
+        } catch (error) {
+          if (event === 'call:join' && !previousCall && socket.data.callConversation) {
+            await serialize(socket.data.callConversation, () => leave(socket)).catch(cleanupError => console.warn('Failed call cleanup deferred:', cleanupError.message));
+          }
+          ack({ success: false, message: error.message || 'Call request failed' });
+        }
       });
     });
     command('call:config', () => iceConfiguration(socket.data.userId));
@@ -122,10 +158,19 @@ function createCallService(io) {
       const now = new Date();
       socket.data.callConversation = payload.conversationId;
       if (!room) {
+        const activeUsers = await User.find({ _id: { $in: meeting?.participants || conversation.members.map(member => member.user) }, isActive: true }).select('_id name').lean();
+        const invited = activeUsers.map(person => person._id);
+        if (invited.length < 2) { socket.data.callConversation = null; throw new Error('Add at least one active participant before calling'); }
+        const oneToOne = !meeting && invited.length === 2;
+        if (oneToOne && [...rooms.values()].some(active => [...active.participants.values()].some(person => person.userId !== socket.data.userId && invited.some(id => String(id) === person.userId)))) {
+          socket.data.callConversation = null; throw new Error('This person is already in another call. Try again later.');
+        }
         room = { id: randomUUID(), conversationId: payload.conversationId, title: conversation.name || 'Team call',
           mode: payload.mode, hostId: socket.data.userId, startedAt: new Date().toISOString(), participants: new Map(),
+          oneToOne, connectedAt: null, ringUntil: null, declined: new Set(),
+          invitedPeople: activeUsers.map(person => ({ id: String(person._id), name: person.name })),
           meetingId: meeting ? String(meeting._id) : null,
-          inviteUsers: (meeting?.participants || conversation.members.map(member => member.user)).map(id => `user:${id}`) };
+          inviteUsers: invited.map(id => `user:${id}`) };
         if (meeting) {
           room.title = meeting.title;
           const reserved = await Meeting.updateOne({ _id: meeting._id, status: 'scheduled' }, { $set: { status: 'in_progress', activeCallId: room.id }, $inc: { __v: 1 } });
@@ -133,7 +178,7 @@ function createCallService(io) {
         }
         try {
           await CallSession.create({ callId: room.id, conversation: conversation._id, meeting: meeting?._id,
-            startedBy: user._id, invitedUsers: meeting?.participants || conversation.members.map(member => member.user),
+            startedBy: user._id, invitedUsers: invited,
             title: room.title, mode: room.mode, startedAt: now, lastSeenAt: now, attendance: [{ user: user._id, joinedAt: now }] });
         } catch (error) {
           socket.data.callConversation = null;
@@ -144,6 +189,11 @@ function createCallService(io) {
       } else await CallSession.updateOne({ callId: room.id, endedAt: null }, { $push: { attendance: { user: user._id, joinedAt: now } }, $set: { lastSeenAt: now } });
       room.participants.set(socket.id, { socketId: socket.id, userId: socket.data.userId, name: user.name,
         microphone: payload.microphone === true, camera: payload.camera === true, sharing: false, handRaised: false });
+      if (!room.connectedAt && room.participants.size >= 2) {
+        room.connectedAt = new Date().toISOString(); clearTimeout(room.ringTimer); room.ringUntil = null;
+        await CallSession.updateOne({ callId: room.id }, { $set: { connectedAt: new Date(room.connectedAt) } });
+      }
+      if (created) ringTimeout(room);
       socket.data.callConversation = payload.conversationId;
       socket.join(`call:${room.id}`);
       broadcast(room);
@@ -190,7 +240,10 @@ function createCallService(io) {
       if (room.meetingId) await Meeting.updateOne({ _id: room.meetingId, activeCallId: room.id }, { $addToSet: { participants: { $each: added } }, $inc: { __v: 1 } });
       if (conversation.purpose === 'meeting') await Conversation.updateOne({ _id: conversation._id }, { $addToSet: { members: { $each: added.map(id => ({ user: id })) } } });
       const destinations = added.map(id => `user:${id}`);
+      const people = (await User.find({ _id: { $in: added } }).select('_id name').lean()).map(person => ({ id: String(person._id), name: person.name }));
       room.inviteUsers.push(...destinations);
+      room.invitedPeople.push(...people);
+      room.oneToOne = false; ringTimeout(room);
       broadcast(room);
       const expiresAt = Date.now() + 45000;
       io.to(destinations).emit('call:incoming', { ...snapshot(room), callerName: user.name, expiresAt });
@@ -201,20 +254,17 @@ function createCallService(io) {
     command('call:end', async payload => {
       const room = joined(payload);
       if (room.hostId !== socket.data.userId) throw new Error('Only the host can end the meeting for everyone');
-      await records.finish(room.id, 'host_ended');
-      io.to([`call:${room.id}`, ...room.inviteUsers]).emit('call:ended', { callId: room.id });
-      for (const id of room.participants.keys()) {
-        const client = io.sockets.sockets.get(id);
-        if (client) { client.data.callConversation = null; client.leave(`call:${room.id}`); }
-      }
-      rooms.delete(room.conversationId); return {};
+      await endRoom(room, 'host_ended'); return {};
     });
     command('call:decline', async (payload, user) => {
       const room = rooms.get(payload.conversationId);
       if (room?.id === payload.callId) {
+        if ([...room.participants.values()].some(person => person.userId === socket.data.userId)) return {};
         await CallSession.updateOne({ callId: room.id }, { $addToSet: { declinedBy: user._id } });
+        room.declined.add(socket.data.userId);
         io.to(`call:${room.id}`).emit('call:declined', { callId: room.id, name: user.name });
         io.to(`user:${socket.data.userId}`).emit('call:dismissed', { callId: room.id });
+        if (!room.meetingId && !room.connectedAt && room.inviteUsers.every(id => id === `user:${room.hostId}` || room.declined.has(id.slice(5)))) await endRoom(room, 'declined');
       }
       return {};
     });
@@ -226,7 +276,8 @@ function createCallService(io) {
   const close = () => {
     if (!closing) closing = (async () => {
       clearInterval(heartbeat);
-      await Promise.allSettled([...pending.values()]);
+      await Promise.allSettled([...joiningUsers.values(), ...pending.values()]);
+      for (const room of rooms.values()) clearTimeout(room.ringTimer);
       await Promise.all([...rooms.values()].map(room => records.finish(room.id, 'server_disconnected')));
       rooms.clear();
     })();

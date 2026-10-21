@@ -53,8 +53,8 @@ after(async () => {
   if (mongo && mongo.exitCode === null) { const stopped = new Promise(resolve => mongo.once('exit', resolve)); mongo.kill(); await stopped; }
   if (directory && path.dirname(directory) === os.tmpdir() && path.basename(directory).startsWith('neximet-calls-test-')) await rm(directory, { recursive: true, force: true });
 });
-async function connect(index) {
-  const client = io(`http://127.0.0.1:${realtime.server.address().port}`, { path: '/api/socket.io', transports: ['websocket'], auth: { token: jwt.sign({ id: users[index]._id }, process.env.JWT_SECRET) }, reconnection: false });
+async function connect(index, instance = realtime) {
+  const client = io(`http://127.0.0.1:${instance.server.address().port}`, { path: '/api/socket.io', transports: ['websocket'], auth: { token: jwt.sign({ id: users[index]._id }, process.env.JWT_SECRET) }, reconnection: false });
   clients.push(client);
   await new Promise((resolve, reject) => { client.once('connect', resolve); client.once('connect_error', reject); });
   return client;
@@ -122,14 +122,14 @@ test('membership, invitations, signaling isolation, media state, host end, and s
 
 test('one call per user/device, disconnect cleanup, host transfer, and fresh meeting IDs', async () => {
   const [alice, otherTab, bob] = await Promise.all([connect(0), connect(0), connect(1)]);
-  const a = await join(alice, direct);
-  assert.equal((await join(otherTab, direct)).success, false);
-  assert.equal((await join(alice, group)).success, false);
-  await join(bob, direct);
+  const a = await join(alice, group);
+  assert.equal((await join(otherTab, group)).success, false);
+  assert.equal((await join(alice, direct)).success, false);
+  await join(bob, group);
   const transferred = event(bob, 'call:updated', value => value.hostId === String(users[1]._id));
   alice.disconnect();
   assert.equal((await transferred).participants.length, 1);
-  assert.equal((await command(bob, 'call:leave', { conversationId: String(direct._id), callId: a.call.id })).success, true);
+  assert.equal((await command(bob, 'call:leave', { conversationId: String(group._id), callId: a.call.id })).success, true);
   const next = await join(otherTab, direct);
   assert.notEqual(next.call.id, a.call.id);
   await command(otherTab, 'call:leave', { conversationId: String(direct._id), callId: next.call.id });
@@ -155,10 +155,9 @@ test('leaving the last participant clears pending invitations and uppercase IDs 
   await invitation;
   const b = await join(bob, direct);
   assert.equal(b.call.id, a.call.id);
-  await command(bob, 'call:leave', { conversationId: String(direct._id), callId: a.call.id });
   const ended = event(bob, 'call:ended');
   await command(alice, 'call:leave', { conversationId: String(direct._id), callId: a.call.id });
-  assert.equal((await ended).callId, a.call.id);
+  assert.equal((await ended).reason, 'participant_left');
   assert.equal((await join(bob, direct, { callId: a.call.id })).success, false);
   alice.disconnect(); bob.disconnect();
 });
@@ -251,7 +250,7 @@ test('history pagination is private and returns older records without duplicates
 
 test('standalone meetings invite users without existing chats and hosts can add live guests', async () => {
   assert.equal((await request(null, '/rooms', { participantIds: [] })).status, 401);
-  for (const participantIds of ['invalid', ['bad'], users.slice(1, 10).map(user => String(user._id))]) assert.equal((await request(0, '/rooms', { participantIds })).status, 400);
+  for (const participantIds of [[], [String(users[0]._id)], 'invalid', ['bad'], users.slice(1, 10).map(user => String(user._id))]) assert.equal((await request(0, '/rooms', { participantIds })).status, 400);
   const created = await request(0, '/rooms', { title: 'Open team voice meeting', participantIds: [String(users[10]._id)] });
   assert.equal(created.status, 201); assert.equal(created.body.room.purpose, 'meeting');
   const room = created.body.room;
@@ -393,6 +392,72 @@ test('meeting pushes and durable reminders respect RSVP, edits, retries, cancell
     names.forEach((name, index) => { if (previous[index] === undefined) delete process.env[name]; else process.env[name] = previous[index]; });
     webpush.sendNotification = original;
   }
+});
+
+test('empty calls are rejected and direct calls ring, connect on answer, and end on decline or departure', async () => {
+  const alone = await Conversation.create({ kind: 'group', purpose: 'meeting', name: 'No invitees', createdBy: users[0]._id, members: [{ user: users[0]._id }] });
+  const [host, recipient] = await Promise.all([connect(0), connect(1)]);
+  assert.equal((await join(host, alone)).success, false);
+  assert.equal(await CallSession.countDocuments({ conversation: alone._id }), 0);
+  assert.equal((await request(0, '', { ...schedule(), participantIds: [] })).status, 400);
+  const first = await join(host, direct, { mode: 'audio', camera: false });
+  assert.equal(first.call.phase, 'ringing'); assert.equal(first.call.oneToOne, true); assert.equal(first.call.connectedAt, null);
+  const declined = event(host, 'call:ended');
+  await command(recipient, 'call:decline', { conversationId: String(direct._id), callId: first.call.id });
+  assert.equal((await declined).reason, 'declined');
+  const history = (await request(0, '/history')).body.history.find(item => item.callId === first.call.id);
+  assert.equal(history.outcome, 'declined');
+  const second = await join(host, direct, { mode: 'audio', camera: false });
+  const answered = await join(recipient, direct, { callId: second.call.id, mode: 'audio', camera: false });
+  assert.equal(answered.call.phase, 'connected'); assert.ok(answered.call.connectedAt);
+  const departed = event(host, 'call:ended');
+  await command(recipient, 'call:leave', { conversationId: String(direct._id), callId: second.call.id });
+  assert.equal((await departed).reason, 'participant_left');
+  assert.equal((await join(host, direct, { callId: second.call.id })).success, false);
+  host.disconnect(); recipient.disconnect();
+});
+
+test('adding someone promotes a direct call to a group and the late guest can join after host handoff', async () => {
+  const [host, recipient, guest] = await Promise.all([connect(0), connect(1), connect(2)]);
+  const created = (await request(0, '/rooms', { participantIds: [String(users[1]._id)] })).body.room;
+  const started = await join(host, created);
+  await join(recipient, created, { callId: started.call.id });
+  const invited = event(guest, 'call:incoming');
+  await command(host, 'call:invite', { conversationId: created._id, callId: started.call.id, participantIds: [String(users[2]._id)] });
+  const invitation = await invited; assert.equal(invitation.oneToOne, false);
+  await command(host, 'call:leave', { conversationId: created._id, callId: started.call.id });
+  const joined = await join(guest, created, { callId: started.call.id });
+  assert.equal(joined.success, true); assert.equal(joined.call.participants.length, 2); assert.equal(joined.call.hostId, String(users[1]._id));
+  await command(recipient, 'call:end', { conversationId: created._id, callId: started.call.id });
+  for (const client of [host, recipient, guest]) client.disconnect();
+});
+
+test('concurrent rooms cannot double-connect a user and a busy person is not called twice', async () => {
+  const rooms = await Promise.all([1, 2].map(index => request(0, '/rooms', { participantIds: [String(users[index]._id)] })));
+  const [first, second, bob] = await Promise.all([connect(0), connect(0), connect(1)]);
+  const joined = await Promise.all([join(first, rooms[0].body.room), join(second, rooms[1].body.room)]);
+  assert.equal(joined.filter(result => result.success).length, 1);
+  const index = joined.findIndex(result => result.success), call = joined[index].call;
+  const busyRoom = (await request(1, '/rooms', { participantIds: [String(users[0]._id)] })).body.room;
+  const busy = await join(bob, busyRoom); assert.equal(busy.success, false); assert.match(busy.message, /another call/);
+  await command([first, second][index], 'call:end', { conversationId: call.conversationId, callId: call.id });
+  for (const client of [first, second, bob]) client.disconnect();
+});
+
+test('an unanswered direct call expires on the server and cannot be answered afterwards', async () => {
+  const instance = createRealtimeServer(express(), { callRingTimeoutMs: 150 });
+  await new Promise(resolve => instance.server.listen(0, '127.0.0.1', resolve));
+  const host = await connect(0, instance);
+  try {
+    const timeout = event(host, 'call:ended');
+    const started = await join(host, direct);
+    assert.equal(started.call.phase, 'ringing');
+    assert.equal((await timeout).reason, 'no_answer');
+    assert.equal((await join(host, direct, { callId: started.call.id })).success, false);
+    await instance.closeCalls();
+    const saved = await CallSession.findOne({ callId: started.call.id });
+    assert.equal(saved.endReason, 'no_answer'); assert.equal(saved.connectedAt, null);
+  } finally { host.disconnect(); await instance.closeCalls(); await new Promise(resolve => instance.io.close(resolve)); }
 });
 
 test('graceful shutdown closes attendance before the database disconnects', async () => {
