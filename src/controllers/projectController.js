@@ -1,3 +1,4 @@
+const activity = require('../services/activityNotifications');
 const Project = require('../models/Project');
 const Task = require('../models/Task');
 const path = require('path');
@@ -117,6 +118,7 @@ exports.createProject = async (req, res) => {
     });
 
     const savedProject = await newProject.save();
+    await activity.project(savedProject, req.user.id, 'created');
     res.status(201).json({ success: true, project: savedProject });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
@@ -138,6 +140,7 @@ exports.updateProject = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Project not found' });
     }
 
+    await activity.project(project, req.user.id);
     res.json({ success: true, project });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
@@ -154,6 +157,7 @@ exports.deleteProject = async (req, res) => {
     }
     // Clean up associated tasks
     await Task.deleteMany({ project: req.params.id });
+    await activity.project(project, req.user.id, 'deleted');
     res.json({ success: true, message: 'Project deleted successfully' });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -210,6 +214,7 @@ exports.uploadScopeDocument = async (req, res) => {
       return res.status(413).json({ success: false, message: 'This project has reached its document storage limit. Remove an older document or upload a smaller file.' });
     }
     await project.save();
+    await activity.project(project, req.user.id, 'scope');
 
     // Return response without huge fileData payload
     const scopeDocsResponse = project.scopeDocuments.map((doc) => {
@@ -269,6 +274,7 @@ exports.deleteScopeDocument = async (req, res) => {
     }
 
     await project.save();
+    await activity.project(project, req.user.id, 'scope');
 
     const scopeDocsResponse = project.scopeDocuments.map((doc) => {
       const d = doc.toObject ? doc.toObject() : { ...doc };
@@ -308,6 +314,7 @@ exports.addCredential = async (req, res) => {
     });
 
     await project.save();
+    await activity.vault(project, project.credentials[project.credentials.length - 1], req.user.id);
     res.json({ success: true, credentials: project.credentials });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
@@ -341,6 +348,7 @@ exports.updateCredential = async (req, res) => {
     if (visibleToRoles !== undefined) targetCred.visibleToRoles = visibleToRoles;
 
     await project.save();
+    await activity.vault(project, targetCred, req.user.id);
     res.json({ success: true, credentials: project.credentials, credential: targetCred });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
@@ -356,11 +364,13 @@ exports.deleteCredential = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Project not found' });
     }
 
+    const removed = project.credentials.find(credential => String(credential._id) === req.params.credId);
     project.credentials = project.credentials.filter(
       (c) => c._id.toString() !== req.params.credId
     );
 
     await project.save();
+    if (removed) await activity.vault(project, removed, req.user.id);
     res.json({ success: true, message: 'Credential removed', credentials: project.credentials });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -379,6 +389,7 @@ exports.updateResources = async (req, res) => {
 
     project.assignedMembers = assignedMembers;
     await project.save();
+    await activity.project(project, req.user.id);
 
     const updated = await Project.findById(req.params.id)
       .populate('assignedMembers.user', 'name email department designation');
@@ -407,6 +418,7 @@ exports.updateMilestones = async (req, res) => {
     }
 
     await project.save();
+    await activity.project(project, req.user.id);
     res.json({
       success: true,
       milestones: project.milestones,

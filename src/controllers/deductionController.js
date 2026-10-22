@@ -1,3 +1,4 @@
+const activity = require('../services/activityNotifications');
 const DeductionRule = require('../models/DeductionRule');
 const Attendance = require('../models/Attendance');
 const { TIME_ZONE, fail, shiftDate, validMonth, normalizeRule, companyRule, validateRule, calculateDeduction } = require('../services/attendancePolicy');
@@ -26,6 +27,7 @@ exports.updateRule = wrap(async (req, res) => {
   for (const key of fields) document[key] = rule[key];
   document.policyKey = 'attendance'; document.updatedBy = req.user.id; document.isActive = true;
   await document.save();
+  await activity.broadcast({ key: `policy:${document._id}:${document.updatedAt.getTime()}`, actor: req.user.id, title: 'Attendance policy updated', body: 'Review the current attendance policy. Changes apply to future check-ins.', url: '/deduction-settings' });
   res.json({ success: true, message: 'Policy saved. Changes apply to future check-ins; recorded deductions retain their original values.', rule: normalizeRule(document), timeZone: TIME_ZONE });
 });
 

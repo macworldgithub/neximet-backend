@@ -1,3 +1,4 @@
+const notifications = require('../services/notifications');
 const mongoose = require('mongoose');
 const Attendance = require('../models/Attendance');
 const User = require('../models/User');
@@ -103,6 +104,7 @@ exports.checkIn = wrap(async (req, res) => {
   if (!record) fail('Attendance changed while checking in. Refresh and try again.', 409);
   await closeEndedShifts(rule, { user: user._id }, now);
   const saved = await Attendance.findById(record._id).select('-auditTrail -override.snapshot');
+  if (!simulated && (saved.isLate || saved.status === 'absent' || saved.deductionAmount > 0)) await notifications.safely({ key: `attendance:${saved._id}:check-in`, users: [saved.user], kind: 'attendance', title: 'Review your attendance result', body: 'Your check-in has an attendance adjustment. Open your attendance history to review the details.', url: '/attendance' });
   res.status(201).json({ success: true, message: (simulated ? 'CEO simulation recorded. ' : 'Check-in recorded. ') + (calculation.status === 'absent' ? 'Arrival after 2 PM counted as a full-day absence.' : calculation.isLate ? calculation.minutesLate + ' minutes late.' : 'On time.'), attendance: saved, distanceFromOffice: location.distanceMeters });
 });
 
@@ -243,6 +245,7 @@ exports.repairRecord = wrap(async (req, res) => {
     return updated;
   });
   if (!repaired) fail('Attendance changed while repairing. Refresh before retrying.', 409);
+  await notifications.safely({ key: `attendance:${repaired._id}:repair:${repaired.__v}`, users: [record.user], actor: req.user.id, kind: 'attendance', title: 'Your attendance record was corrected', body: `An administrator repaired your attendance for ${date}. Open your attendance history to review it.`, url: '/attendance' });
   await closeEndedShifts(rule, { user: record.user });
   res.json({ success: true, message: 'Legacy record repaired with an audit trail.', attendance: await Attendance.findById(repaired._id).select('-photo -auditTrail -override.snapshot') });
 });
@@ -295,6 +298,7 @@ async function overrideAttendance(req, res, absent) {
   });
   await closeEndedShifts(rule, { user: userId });
   const saved = await Attendance.findById(updated._id).select('-auditTrail -override.snapshot');
+  await notifications.safely({ key: `attendance:${saved._id}:${saved.__v}:${absent ? 'absent' : 'present'}`, users: [userId], actor: req.user.id, kind: 'attendance', title: 'Your attendance was updated by an administrator', body: `Your attendance for ${date} changed. Open your attendance history to review it.`, url: '/attendance' });
   res.json({ success: true, message: employeeName + ': ' + (absent ? 'marked absent' : req.body.verifyPresence ? 'presence verified without deduction' : 'attendance restored') + ' for ' + date + '. Original check-in evidence retained.', attendance: saved });
 }
 exports.markAbsent = wrap((req, res) => overrideAttendance(req, res, true));

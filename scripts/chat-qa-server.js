@@ -40,7 +40,7 @@ async function main() {
     catch (error) { if (attempt === 39) throw error; await new Promise((resolve) => setTimeout(resolve, 200)); }
   }
   await Promise.all([User.init(), Conversation.init(), Message.init()]);
-  const fixtureUsers = await User.create(['Alex Morgan', 'Sam Rivera', 'Jordan Lee', 'Maya Patel'].map((name, index) => ({ name, email: `chat-qa-${index}@example.test`, password: 'chat-qa-only', department: 'Software Development', role: 'Team Member' })));
+  const fixtureUsers = await User.create(['Alex Morgan', 'Sam Rivera', 'Jordan Lee', 'Maya Patel', 'Casey Director'].map((name, index) => ({ name, email: `chat-qa-${index}@example.test`, password: 'chat-qa-only', department: 'Software Development', role: index === 4 ? 'CEO' : 'Team Member' })));
   const [alice, bob, carol] = fixtureUsers;
   const direct = await Conversation.create({ kind: 'direct', directKey: [String(alice._id), String(bob._id)].sort().join(':'), members: [{ user: alice._id }, { user: bob._id }], createdBy: alice._id, nextSequence: 62 });
   await Message.insertMany(Array.from({ length: 62 }, (_, index) => ({ conversation: direct._id, sender: index % 2 ? alice._id : bob._id, sequence: index + 1, clientId: `qa-seed-${index}`, text: index === 61 ? 'The release checklist is ready. Can you review it today?' : `Project update ${index + 1}: the team is making good progress.`, readBy: [bob._id], createdAt: new Date(Date.now() - (62 - index) * 60000) })));
@@ -61,6 +61,8 @@ async function main() {
   app.get('/api/leaves/summary', (req, res) => res.json({ success: true, totalHolidaysLeft: 32 }));
   app.use('/api/chat', require('../src/routes/chatRoutes'));
   app.use('/api/meetings', require('../src/routes/meetingRoutes'));
+  app.use('/api/announcements', require('../src/routes/announcementRoutes'));
+  app.use('/api/notifications', require('../src/routes/notificationRoutes'));
   app.use((error, req, res, next) => res.status(error.status || 500).json({ success: false, message: error.message }));
   realtime = require('../src/services/realtime').createRealtimeServer(app, { pollInterval: 100 });
   server = realtime.server.listen(Number(process.env.QA_PORT || 4011), '127.0.0.1', () => console.log(`Temporary chat QA API on port ${server.address().port}. Synthetic accounts only.`));

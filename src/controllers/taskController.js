@@ -1,3 +1,4 @@
+const activity = require('../services/activityNotifications');
 const Task = require('../models/Task');
 const TimeLog = require('../models/TimeLog');
 const Project = require('../models/Project');
@@ -88,6 +89,7 @@ exports.createTask = async (req, res) => {
       .populate('reporter', 'name email department designation role')
       .populate('comments.user', 'name email role department designation');
 
+    await activity.task(task, req.user.id, 'created');
     res.status(201).json({ success: true, task: populated });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
@@ -98,6 +100,7 @@ exports.createTask = async (req, res) => {
 // @route   PUT /api/tasks/:id
 exports.updateTask = async (req, res) => {
   try {
+    const previous = await Task.findById(req.params.id).lean();
     const task = await Task.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true })
       .populate('assignedTo', 'name email department designation role')
       .populate('reporter', 'name email department designation role')
@@ -107,6 +110,8 @@ exports.updateTask = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Task not found' });
     }
 
+    const fields = ['title', 'description', 'assignedTo', 'reporter', 'status', 'priority', 'dueDate'];
+    if (fields.some(key => req.body[key] !== undefined && String(previous?.[key]?._id || previous?.[key] || '') !== String(task[key]?._id || task[key] || ''))) await activity.task(task, req.user.id, 'updated', previous?.assignedTo);
     res.json({ success: true, task });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
@@ -117,6 +122,7 @@ exports.updateTask = async (req, res) => {
 // @route   PATCH /api/tasks/:id/status
 exports.updateTaskStatus = async (req, res) => {
   try {
+    const previous = await Task.findById(req.params.id).select('status').lean();
     const { status, order } = req.body;
     const updateData = {};
     if (status) updateData.status = status === 'completed' ? 'done' : status;
@@ -131,6 +137,7 @@ exports.updateTaskStatus = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Task not found' });
     }
 
+    if (previous?.status !== task.status) await activity.task(task, req.user.id, 'status');
     res.json({ success: true, task });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
@@ -159,6 +166,7 @@ exports.addSubtask = async (req, res) => {
       .populate('reporter', 'name email department designation role')
       .populate('comments.user', 'name email role department designation');
 
+    await activity.task(task, req.user.id, 'progress');
     res.json({ success: true, task: populated });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
@@ -187,6 +195,7 @@ exports.toggleSubtask = async (req, res) => {
       .populate('reporter', 'name email department designation role')
       .populate('comments.user', 'name email role department designation');
 
+    await activity.task(task, req.user.id, 'progress');
     res.json({ success: true, task: populated });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
@@ -210,6 +219,7 @@ exports.deleteSubtask = async (req, res) => {
       .populate('reporter', 'name email department designation role')
       .populate('comments.user', 'name email role department designation');
 
+    await activity.task(task, req.user.id, 'progress');
     res.json({ success: true, task: populated });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
@@ -242,6 +252,7 @@ exports.addComment = async (req, res) => {
       .populate('reporter', 'name email department designation role')
       .populate('comments.user', 'name email role department designation');
 
+    await activity.task(task, req.user.id, 'comment');
     res.json({ success: true, task: populated });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
@@ -256,6 +267,7 @@ exports.deleteTask = async (req, res) => {
     if (!task) {
       return res.status(404).json({ success: false, message: 'Task not found' });
     }
+    await activity.task(task, req.user.id, 'deleted');
     res.json({ success: true, message: 'Task deleted successfully' });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });

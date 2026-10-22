@@ -54,6 +54,8 @@ function createApp({ config = runtimeConfig(), connect = connectDB, database = m
   app.use('/api/dashboard', require('./routes/dashboardRoutes'));
   app.use('/api/chat', require('./routes/chatRoutes'));
   app.use('/api/meetings', require('./routes/meetingRoutes'));
+  app.use('/api/announcements', require('./routes/announcementRoutes'));
+  app.use('/api/notifications', require('./routes/notificationRoutes'));
   app.use('/api/mail', require('./routes/mailRoutes'));
   app.use('/api/ai', require('./routes/aiRoutes'));
 

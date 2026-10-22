@@ -1,3 +1,5 @@
+const notifications = require('../services/notifications');
+const activity = require('../services/activityNotifications');
 const LeaveRequest = require('../models/LeaveRequest');
 const Holiday = require('../models/Holiday');
 const User = require('../models/User');
@@ -68,6 +70,7 @@ exports.applyLeave = async (req, res) => {
     });
 
     await leaveRequest.save();
+    await activity.executiveEvent({ key: `leave:${leaveRequest._id}:requested`, actor: req.user.id, title: 'Leave request awaiting review', body: 'An employee submitted a leave request.', url: '/leaves' });
 
     res.status(201).json({
       success: true,
@@ -138,6 +141,7 @@ exports.reviewLeaveRequest = async (req, res) => {
       return leave.toObject();
     });
 
+    await notifications.safely({ key: `leave:${leaveRequest._id}:${status}`, users: [leaveRequest.user], actor: req.user.id, kind: 'leave', title: `Your leave request was ${status}`, body: 'Open Leaves & Holidays for the decision and review comments.', url: '/leaves' });
     res.json({
       success: true,
       message: `Leave request has been ${status}`,
@@ -167,6 +171,7 @@ exports.createHoliday = async (req, res) => {
     if (!validDate(req.body.date)) fail('Holiday date must be YYYY-MM-DD.');
     const holiday = new Holiday({ ...req.body, date: atCompanyTime(req.body.date, '00:00'), year: Number(req.body.date.slice(0, 4)) });
     await holiday.save();
+    await activity.broadcast({ key: `holiday:${holiday._id}`, actor: req.user.id, title: 'Company holiday calendar updated', body: 'Open Leaves & Holidays to view the new holiday.', url: '/leaves' });
     res.status(201).json({ success: true, holiday });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });

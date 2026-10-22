@@ -19,10 +19,10 @@ function createRealtimeServer(app, { pollInterval = 1000, config = runtimeConfig
     pingInterval: 20000,
     pingTimeout: 20000,
   });
-  let startup, stream, pollTimer, stopMeetingNotifications, closed = false;
+  let startup, stream, pollTimer, stopMeetingNotifications, stopNotifications, closed = false;
   const calls = require('./calls').createCallService(io, { ringTimeoutMs: callRingTimeoutMs });
-  server.on('listening', () => { stopMeetingNotifications = require('./meetingNotifications').start(); });
-  const closeCalls = async () => { await calls.close(); await stopMeetingNotifications?.(); };
+  server.on('listening', () => { stopMeetingNotifications = require('./meetingNotifications').start(); stopNotifications = require('./notifications').start(); });
+  const closeCalls = async () => { await calls.close(); await stopMeetingNotifications?.(); await stopNotifications?.(); };
   const received = new Map();
   let fanout = Promise.resolve();
   const dispatch = (event) => {

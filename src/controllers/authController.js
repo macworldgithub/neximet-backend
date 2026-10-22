@@ -1,3 +1,5 @@
+const notifications = require('../services/notifications');
+const activity = require('../services/activityNotifications');
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const mongoose = require('mongoose');
@@ -258,6 +260,7 @@ exports.updateUser = async (req, res) => {
         .populate('reportsTo', 'name email role designation');
     });
 
+    await notifications.safely({ key: `account:${updatedUser._id}:${updatedUser.updatedAt?.getTime()}`, users: [updatedUser._id], actor: req.user.id, kind: 'account', title: 'Your employee account was updated', body: 'Your administrator updated your account details. Review your profile or contact your administrator.', url: '/dashboard' });
     res.json({
       success: true,
       message: 'Employee updated successfully.',
@@ -295,6 +298,7 @@ exports.requestForgotPassword = async (req, res) => {
       });
     }
 
+    if (user.passwordResetRequest?.status === 'Pending') return res.json({ success: true, isCeo: false, message: 'Your password reset request is already awaiting administrator review.' });
     // For all other roles: Notify admin via user.passwordResetRequest
     user.passwordResetRequest = {
       status: 'Pending',
@@ -302,6 +306,7 @@ exports.requestForgotPassword = async (req, res) => {
     };
     await user.save();
 
+    await activity.executiveEvent({ key: `password-request:${user._id}:${user.passwordResetRequest.requestedAt.getTime()}`, title: 'Password reset request awaiting review', body: 'An employee requested help signing in. Open the employee directory to review requests.', url: '/employees' });
     res.json({
       success: true,
       isCeo: false,
@@ -447,6 +452,7 @@ exports.adminResetPassword = async (req, res) => {
     };
     await user.save();
 
+    await notifications.safely({ key: `password-reset:${user._id}:${user.passwordResetRequest.resolvedAt.getTime()}`, users: [user._id], actor: req.user.id, kind: 'account', title: 'Your password was reset by an administrator', body: 'Contact your administrator if you did not request this change. Passwords are never included in notifications.', url: '/dashboard' });
     res.json({
       success: true,
       message: `Password for ${user.name} has been successfully updated.`,

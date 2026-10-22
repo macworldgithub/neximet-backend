@@ -6,6 +6,7 @@ const PushSubscription = require('../models/PushSubscription');
 const MeetingPushJob = require('../models/MeetingPushJob');
 const User = require('../models/User');
 const { configured } = require('./chatPush');
+const notifications = require('./notifications');
 
 async function enqueue(event, users) {
   if (!configured() || !users.length) return;
@@ -29,6 +30,11 @@ async function notifyCall(callId, userIds, expiresAt) {
   kick();
 }
 async function notifyMeeting(meeting, kind = 'meeting_invitation') {
+  await require('../models/Notification').updateMany({ meeting: meeting._id, ...(kind === 'meeting_cancelled' ? {} : { user: { $nin: meeting.participants.map(person => person._id || person) } }) }, { $set: { withdrawn: true } })
+    .catch(error => console.warn('Meeting inbox cleanup failed:', error.message));
+  await notifications.safely({ key: `${kind}:${meeting._id}:${meeting.notificationRevision || 0}`, users: meeting.participants, actor: meeting.organizer,
+    kind: 'meeting', title: { meeting_invitation: 'You are invited to a meeting', meeting_updated: 'A meeting invitation was updated', meeting_cancelled: 'A meeting was cancelled' }[kind],
+    body: meeting.title, url: `/meet?conversation=${meeting.conversation}&meeting=${meeting._id}&mode=${meeting.mode}`, meeting: meeting._id, push: false });
   if (!configured()) return;
   await enqueue({ key: `${kind}:${meeting._id}:${meeting.notificationRevision || 0}`, kind, meeting: meeting._id,
     revision: meeting.notificationRevision || 0, expiresAt: new Date(Math.min(+meeting.endsAt, Date.now() + 86400000)) },
@@ -36,6 +42,8 @@ async function notifyMeeting(meeting, kind = 'meeting_invitation') {
   kick();
 }
 async function notifyCallEnded(session) {
+  const missed = session.invitedUsers.filter(id => String(id) !== String(session.startedBy) && !session.attendance.some(item => String(item.user) === String(id)) && !session.declinedBy.some(person => String(person) === String(id)));
+  await notifications.safely({ key: `missed:${session.callId}`, users: missed, kind: 'call', title: `Missed ${session.mode === 'audio' ? 'voice' : 'video'} call`, body: session.title, url: '/meet?view=history', push: false });
   if (!configured()) return;
   await enqueue({ key: `ended:${session.callId}`, kind: 'call_ended', call: session._id, expiresAt: new Date(Date.now() + 300000) },
     session.invitedUsers.filter(id => String(id) !== String(session.startedBy)));
@@ -46,6 +54,9 @@ async function prepareReminders(now = new Date()) {
   for (const meeting of meetings) {
     const kind = meeting.startsAt > now ? 'meeting_reminder' : 'meeting_starting';
     const declined = new Set(meeting.responses.filter(item => item.response === 'declined').map(item => String(item.user)));
+    await notifications.safely({ key: `${kind}:${meeting._id}:${meeting.notificationRevision || 0}`, users: meeting.participants.filter(id => !declined.has(String(id))),
+      kind: 'meeting', title: kind === 'meeting_reminder' ? 'Your meeting starts soon' : 'Your meeting starts now', body: meeting.title,
+      url: `/meet?conversation=${meeting.conversation}&meeting=${meeting._id}&mode=${meeting.mode}`, meeting: meeting._id, push: false });
     await enqueue({ key: `${kind}:${meeting._id}:${meeting.notificationRevision || 0}`, kind, meeting: meeting._id,
       revision: meeting.notificationRevision || 0, expiresAt: kind === 'meeting_reminder' ? meeting.startsAt : new Date(Math.min(+meeting.endsAt, +meeting.startsAt + 120000)) },
     meeting.participants.filter(id => !declined.has(String(id))));
@@ -101,12 +112,13 @@ async function deliver(id) {
 }
 let running, again = false;
 function flush() {
-  if (!configured() || mongoose.connection.readyState !== 1) return Promise.resolve();
+  if (mongoose.connection.readyState !== 1) return Promise.resolve();
   if (running) { again = true; return running; }
   running = (async () => {
     do {
       again = false;
       await prepareReminders();
+      if (!configured()) return;
       const jobs = await MeetingPushJob.find({ status: 'pending', nextAttemptAt: { $lte: new Date() } }).sort({ kind: 1, createdAt: 1 }).limit(100);
       for (let i = 0; i < jobs.length; i += 5) {
         await Promise.all(jobs.slice(i, i + 5).map(job => deliver(job._id)));
