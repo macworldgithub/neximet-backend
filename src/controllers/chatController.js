@@ -2,6 +2,7 @@ const Conversation = require('../models/Conversation');
 const Message = require('../models/Message');
 const User = require('../models/User');
 const { publish } = require('../services/chatEvents');
+const chatMedia = require('../services/chatMedia');
 
 const publicUser = '_id name department role isActive';
 const validId = (id) => typeof id === 'string' && /^[a-f\d]{24}$/i.test(id);
@@ -111,8 +112,8 @@ exports.sendMessage = wrap(async (req, res) => {
   const key = { conversation: conversation._id, sender: req.user._id, clientId };
   let message = await Message.findOne(key);
   if (!message) {
+    const attachment = req.file ? chatMedia.attachment(req.file) : undefined;
     const sequence = await Conversation.findByIdAndUpdate(conversation._id, { $inc: { nextSequence: 1 } }, { new: true });
-    const attachment = req.file ? { name: req.file.originalname.replace(/[\r\n\x00]/g, '').slice(0, 200), size: req.file.size, mimeType: req.file.mimetype, data: req.file.buffer } : undefined;
     try {
       message = await Message.create({ ...key, sequence: sequence.nextSequence, text: text.trim(), attachment, readBy: [req.user._id], deliveredBy: [req.user._id] });
     } catch (error) {
@@ -158,8 +159,12 @@ exports.downloadAttachment = wrap(async (req, res) => {
   if (!validId(req.params.messageId)) throw fail(400, 'Invalid message');
   const message = await Message.findOne({ _id: req.params.messageId, conversation: conversation._id }).select('+attachment.data');
   if (!message?.attachment?.data) throw fail(404, 'Attachment not found');
-  res.setHeader('Content-Type', 'application/octet-stream');
+  const preview = req.query.preview === '1';
+  const type = preview ? chatMedia.mediaType(message.attachment.data) : null;
+  if (preview && !type) throw fail(415, 'This attachment cannot be previewed. Download it to open it on your device.');
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.setHeader('Content-Type', type || 'application/octet-stream');
   res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(message.attachment.name)}`);
+  res.setHeader('Content-Disposition', `${preview ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(message.attachment.name)}`);
   res.send(message.attachment.data);
 });

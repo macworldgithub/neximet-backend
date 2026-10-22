@@ -212,6 +212,44 @@ test('files persist privately, can be downloaded by recipients and reject unsupp
     assert.equal((await request(alice, `/conversations/${direct}/messages`, upload)).status, 400);
   }
 });
+
+test('images and videos preview privately using detected bytes rather than the supplied MIME type', async () => {
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7foAAAAASUVORK5CYII=', 'base64');
+  const mp4 = Buffer.alloc(3 * 1024 * 1024 + 128); mp4.writeUInt32BE(24, 0); mp4.write('ftypisom', 4);
+  for (const [name, data, type] of [['photo.png', png, 'image/png'], ['clip.mp4', mp4, 'video/mp4']]) {
+    const form = new FormData(); form.append('clientId', `media-${name.replace('.', '-')}`);
+    form.append('attachment', new Blob([data], { type: 'text/html' }), name);
+    const sent = await request(alice, `/conversations/${direct}/messages`, form);
+    assert.equal(sent.status, 201, sent.body.message); assert.equal(sent.body.message.attachment.mimeType, type);
+    assert.equal(sent.body.message.attachment.data, undefined);
+    const endpoint = `/conversations/${direct}/messages/${sent.body.message._id}/attachment`;
+    const preview = await request(bob, `${endpoint}?preview=1`);
+    assert.equal(preview.status, 200); assert.equal(preview.headers.get('content-type'), type);
+    assert.match(preview.headers.get('content-disposition'), /^inline;/);
+    assert.equal(preview.headers.get('cache-control'), 'private, no-store');
+    assert.equal(preview.headers.get('x-content-type-options'), 'nosniff');
+    assert.deepEqual(Buffer.from(preview.body), data);
+    assert.equal((await request(carol, `${endpoint}?preview=1`)).status, 404);
+    assert.equal((await request(null, `${endpoint}?preview=1`)).status, 401);
+    assert.match((await request(bob, endpoint)).headers.get('content-disposition'), /^attachment;/);
+  }
+});
+
+test('old media previews safely and invalid or oversized media keeps its download fallback', async () => {
+  const legacy = await Message.create({ conversation: direct, sender: alice._id, sequence: 999, clientId: 'legacy-media', attachment: { name: 'old-photo.png', mimeType: 'application/octet-stream', size: 12, data: Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0]) } });
+  const endpoint = `/conversations/${direct}/messages/${legacy._id}/attachment`;
+  assert.equal((await request(bob, `${endpoint}?preview=1`)).headers.get('content-type'), 'image/png');
+  await Message.updateOne({ _id: legacy._id }, { $set: { 'attachment.data': Buffer.from('<script>unsafe</script>') } });
+  assert.equal((await request(bob, `${endpoint}?preview=1`)).status, 415);
+  const fallback = await request(bob, endpoint);
+  assert.equal(fallback.status, 200); assert.equal(fallback.headers.get('content-type'), 'application/octet-stream');
+  for (const [name, content] of [['fake.png', '<html>not a photo</html>'], ['fake.mp4', 'not a video'], ['large.png', Buffer.alloc(3 * 1024 * 1024 + 1)], ['large.webm', Buffer.alloc(12 * 1024 * 1024 + 1)]]) {
+    const form = new FormData(); form.append('clientId', `rejected-${name.replace('.', '-')}`); form.append('attachment', new Blob([content]), name);
+    const result = await request(alice, `/conversations/${direct}/messages`, form);
+    assert.equal(result.status, 400); assert.doesNotMatch(result.body.message, /request ID/);
+  }
+  await Message.deleteOne({ _id: legacy._id });
+});
 test('history pagination and forward catchup return every message once in sequence order', async () => {
   const chat = await Conversation.create({ kind: 'group', name: 'History', members: [{ user: alice._id }, { user: bob._id }, { user: carol._id }], createdBy: alice._id, nextSequence: 125 });
   await Message.insertMany(Array.from({ length: 125 }, (_, index) => ({ conversation: chat._id, sender: alice._id, sequence: index + 1, clientId: `history-${index}`, text: `Message ${index + 1}`, readBy: [alice._id] })));
