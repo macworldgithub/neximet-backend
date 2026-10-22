@@ -7,6 +7,8 @@ const schema = new mongoose.Schema({
   displayName: { type: String, default: '' },
   passwordEncrypted: { type: String, required: true, select: false },
   notificationsEnabled: { type: Boolean, default: true },
+  pushCheckpoint: { validity: { type: String, select: false }, nextUid: { type: Number, select: false } },
+  notificationPollAt: { type: Date, default: Date.now, select: false, index: true },
 }, { timestamps: true });
 
 module.exports = mongoose.model('MailAccount', schema);

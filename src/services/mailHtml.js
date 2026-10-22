@@ -23,9 +23,10 @@ function contentId(value) {
 // Output is only for the sandboxed email document, never the portal's DOM.
 // Email styles are retained inside that isolated document; its CSP blocks all
 // scripts, forms, nested frames, fonts and external CSS/network resources.
-function formatMailBody(parsed, attachments = []) {
+function formatMailBody(parsed, attachments = [], { preserveCid = false } = {}) {
   const embedded = new Map(), used = new Set();
   attachments.forEach((item, index) => {
+    if (preserveCid && item.cid && Buffer.isBuffer(item.content)) embedded.set(contentId(item.cid), { index, src: `cid:${item.cid}` });
     if (item.contentId && /^data:image\/webp;base64,[a-z\d+/=]+$/i.test(item.preview?.dataUrl || '')) embedded.set(contentId(item.contentId), { index, preview: item.preview });
   });
   let hasRemoteImages = false;
@@ -43,7 +44,7 @@ function formatMailBody(parsed, attachments = []) {
       font: ['color', 'face', 'size'], ol: ['start', 'type', 'reversed'], li: ['value'],
     },
     allowedSchemes: ['https', 'http', 'mailto', 'tel', 'data'],
-    allowedSchemesByTag: { img: ['https', 'http', 'data'] },
+    allowedSchemesByTag: { img: ['https', 'http', 'data', ...(preserveCid ? ['cid'] : [])] },
     allowProtocolRelative: false,
     nonTextTags: ['script', 'textarea', 'option', 'noscript', 'title', 'iframe', 'object', 'template'],
     transformTags: {
@@ -56,7 +57,7 @@ function formatMailBody(parsed, attachments = []) {
         const src = (attribs.src || '').trim();
         if (/^cid:/i.test(src)) {
           const image = embedded.get(contentId(src.slice(4)));
-          if (image) { used.add(image.index); return { tagName, attribs: { ...attribs, src: image.preview.dataUrl } }; }
+          if (image) { used.add(image.index); return { tagName, attribs: { ...attribs, src: image.src || image.preview.dataUrl } }; }
         } else if (/^https?:\/\//i.test(src)) {
           hasRemoteImages = true;
           return { tagName, attribs: { ...attribs, src } };

@@ -8,14 +8,14 @@ const Announcement = require('../models/Announcement');
 const { configured } = require('./chatPush');
 const idOf = value => String(value?._id || value || '');
 
-async function notify({ key, users, actor, kind, title, body = '', url, announcement, meeting, push = true }) {
+async function notify({ key, users, actor, kind, title, body = '', url, announcement, meeting, mailbox, mailboxEmail, push = true }) {
   const ids = [...new Set((users || []).map(idOf))].filter(id => mongoose.isValidObjectId(id) && id !== idOf(actor));
   if (!ids.length) return;
   const active = await User.find({ _id: { $in: ids }, isActive: true }).distinct('_id');
   if (!active.length) return;
   await Notification.init();
   try { await Notification.bulkWrite(active.map(user => ({ updateOne: {
-    filter: { key, user }, update: { $setOnInsert: { key, user, kind, title, body: body.slice(0, 300), url, pushPrepared: !push, ...(announcement ? { announcement } : {}), ...(meeting ? { meeting } : {}) } }, upsert: true,
+    filter: { key, user }, update: { $setOnInsert: { key, user, kind, title, body: body.slice(0, 300), url, pushPrepared: !push, ...(announcement ? { announcement } : {}), ...(meeting ? { meeting } : {}), ...(mailbox ? { mailbox, mailboxEmail } : {}) } }, upsert: true,
   } })), { ordered: false }); } catch (error) {
     if (error.code !== 11000 || error.writeErrors?.some(item => item.code !== 11000)) throw error;
   }
@@ -56,10 +56,11 @@ async function deliver(id) {
   if (!job) return;
   try {
     const [notification, subscription, active] = await Promise.all([
-      Notification.findOne({ _id: job.notification, user: job.user, readAt: null, withdrawn: false }),
+      Notification.findOne({ _id: job.notification, user: job.user, readAt: null, withdrawn: false }).select('+mailboxEmail'),
       Subscription.findOne({ _id: job.subscription, user: job.user }), User.exists({ _id: job.user, isActive: true }),
     ]);
-    if (notification && subscription && active && +notification.createdAt > +now - 86400000) {
+    const mailboxAllowed = !notification?.mailbox || await require('../models/MailAccount').exists({ _id: notification.mailbox, user: job.user, email: notification.mailboxEmail, notificationsEnabled: true });
+    if (notification && subscription && active && mailboxAllowed && +notification.createdAt > +now - 86400000) {
       await webpush.sendNotification({ endpoint: subscription.endpoint, keys: subscription.keys }, JSON.stringify({
         kind: 'platform_notification', userId: idOf(job.user), notificationId: idOf(notification),
         title: notification.title, body: notification.body, url: notification.url,

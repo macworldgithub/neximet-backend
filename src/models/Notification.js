@@ -8,6 +8,8 @@ const schema = new mongoose.Schema({
   url: { type: String, required: true },
   announcement: { type: mongoose.Schema.Types.ObjectId, ref: 'Announcement' },
   meeting: { type: mongoose.Schema.Types.ObjectId, ref: 'Meeting' },
+  mailbox: { type: mongoose.Schema.Types.ObjectId, ref: 'MailAccount' },
+  mailboxEmail: { type: String, select: false },
   readAt: { type: Date, default: null },
   withdrawn: { type: Boolean, default: false },
   pushPrepared: { type: Boolean, default: false },

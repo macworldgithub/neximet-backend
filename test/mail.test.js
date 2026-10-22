@@ -9,6 +9,7 @@ const MailAccount = require('../src/models/MailAccount');
 const User = require('../src/models/User');
 const sharp = require('sharp');
 const MailComposer = require('nodemailer/lib/mail-composer');
+const { simpleParser } = require('mailparser');
 const { attachmentPreviews } = require('../src/services/mailAttachments');
 const { formatMailBody, plainTextHtml } = require('../src/services/mailHtml');
 process.env.MAIL_ENCRYPTION_KEY = 'ab'.repeat(32);
@@ -316,4 +317,52 @@ test('every real mail route rejects unauthenticated HTTP requests before touchin
       assert.equal(response.status, 401); assert.equal((await response.json()).success, false);
     }
   } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
+const forwardSource = { folder: 'inbox', uid: '42', uidValidity: '123', includeAttachments: true };
+test('forward validation permits an optional note, validates source identity, and ignores client attachments/HTML', () => {
+  const result = validateMessage({ ...draft, text: '', forward: forwardSource, html: '<script>unsafe</script>', attachments: [{ path: 'C:/private.txt' }] });
+  assert.equal(result.text, ''); assert.deepEqual(result.forward, forwardSource); assert.equal('html' in result, false); assert.equal('attachments' in result, false);
+  for (const forward of [null, {}, { ...forwardSource, folder: '../mailbox' }, { ...forwardSource, uid: '0' }, { ...forwardSource, uid: '4294967296' }, { ...forwardSource, uidValidity: '' }, { ...forwardSource, includeAttachments: 'true' }]) {
+    assert.throws(() => validateMessage({ ...draft, forward }), /forwarded message is invalid/);
+  }
+});
+test('forwarding preserves formatted content, original attachment bytes and embedded images while using only new recipients', async () => {
+  const pdf = Buffer.from('original attachment bytes'), image = Buffer.from('original inline image bytes');
+  const original = await new MailComposer({ from: 'Original Sender <original@example.com>', to: 'owner@example.com', cc: 'old-copy@example.com', bcc: 'private-copy@example.com',
+    subject: 'Source subject', text: 'Original body', html: '<p><b>Original body</b></p><img src="cid:original-image"/><script>bad()</script>',
+    attachments: [{ filename: 'report.pdf', content: pdf, contentType: 'application/pdf' }, { filename: 'photo.png', content: image, cid: 'original-image', contentType: 'image/png' }],
+  }).compile().build();
+  const { service, calls } = fakeProvider({ rows: [{ uid: 42, size: original.length, source: original }] });
+  const message = await service.prepareForward(account, validateMessage({ ...draft, to: 'new@example.com;second@example.com', cc: 'new-copy@example.com', subject: 'Fwd: Source subject', text: 'Please review.', forward: forwardSource }));
+  assert.match(message.html, /<b>Original body<\/b>/); assert.match(message.html, /cid:original-image/); assert.doesNotMatch(message.html, /script|bad\(\)/);
+  assert.match(message.text, /Forwarded message/); assert.match(message.text, /Original Sender/); assert.match(message.text, /Please review/); assert.doesNotMatch(message.text, /private-copy/);
+  assert.equal(calls.flags.length, 0); assert.equal(calls.lock.config.readOnly, true); assert.equal(calls.released, 1);
+  await service.send(account, message);
+  assert.deepEqual(calls.sent[0].envelope.to, ['new@example.com', 'second@example.com', 'new-copy@example.com']);
+  const forwarded = await simpleParser(calls.sent[0].raw);
+  assert.equal(forwarded.from.value[0].address, account.email); assert.equal(forwarded.subject, 'Fwd: Source subject'); assert.equal(forwarded.attachments.length, 2);
+  assert.deepEqual(forwarded.attachments.find(item => item.filename === 'report.pdf').content, pdf);
+  assert.deepEqual(forwarded.attachments.find(item => item.filename === 'photo.png').content, image);
+});
+test('forwarding can omit attachments and rejects stale, missing or oversized originals before SMTP', async () => {
+  const original = await new MailComposer({ from: 'sender@example.com', subject: 'Original', html: '<p>Body</p><img src="cid:photo"/>', attachments: [{ filename: 'photo.png', content: Buffer.from('picture'), cid: 'photo' }] }).compile().build();
+  const { service, calls } = fakeProvider({ rows: [{ uid: 42, size: original.length, source: original }] });
+  const message = await service.prepareForward(account, validateMessage({ ...draft, forward: { ...forwardSource, folder: 'sent', includeAttachments: false } }));
+  assert.equal(message.attachments.length, 0); assert.doesNotMatch(message.html, /cid:photo/); assert.equal(calls.lock.path, 'Sent');
+  await assert.rejects(service.prepareForward(account, { ...validateMessage(draft), forward: { ...forwardSource, uidValidity: '456' } }), error => error.status === 409);
+  await assert.rejects(fakeProvider({ missing: true }).service.prepareForward(account, { ...validateMessage(draft), forward: forwardSource }), error => error.status === 404);
+  const large = fakeProvider({ rows: [{ uid: 42, size: 6 * 1024 * 1024 }] });
+  await assert.rejects(large.service.prepareForward(account, { ...validateMessage(draft), forward: forwardSource }), error => error.status === 413);
+  assert.equal(calls.sent.length, 0); assert.equal(large.calls.sent.length, 0);
+});
+test('forward receipts are retry safe and source failures leave the unsent draft editable', async () => {
+  let prepared = 0, sent = 0, owner;
+  const harness = handlersHarness({ prepareForward: async (account, message) => { prepared++; owner = account.email; return { ...message, text: 'Original plus note' }; }, send: async () => { sent++; return { messageId: 'forwarded', sentCopySaved: true }; } }); connected(harness);
+  const body = { ...draft, text: '', forward: forwardSource, userId: 'other-user', requestId: '33333333-3333-4333-8333-333333333333' };
+  assert.equal((await harness.call('send', { body })).body.success, true); assert.equal(owner, account.email);
+  assert.equal((await harness.call('send', { body })).body.success, true); assert.equal(prepared, 1); assert.equal(sent, 1);
+  assert.equal((await harness.call('send', { body: { ...body, forward: { ...forwardSource, includeAttachments: false } } })).code, 409);
+  const missing = handlersHarness({ prepareForward: async () => { throw Object.assign(Error('Original message not found.'), { status: 404 }); } }); connected(missing);
+  const failed = await missing.call('send', { body }); assert.equal(failed.code, 404); assert.equal(failed.body.safeToEdit, true); assert.equal(missing.receipts.size, 0);
 });

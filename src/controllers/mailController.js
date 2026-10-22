@@ -18,7 +18,7 @@ function createMailHandlers({ Account = MailAccount, Submission = MailSubmission
       catch (error) {
         // Provider errors can contain usernames, raw responses, and credentials. Never echo/log them.
         const authFailed = error.authenticationFailed || error.code === 'EAUTH';
-        res.status(error.status || (authFailed ? 422 : 502)).json({ success: false, safeToEdit: error.status === 400, message: error.status ? error.message : authFailed ? 'Hostinger could not authenticate this mailbox. Check the email address and mailbox password in Mail settings.' : 'Unable to connect to Hostinger Mail. Please try again shortly.' });
+        res.status(error.status || (authFailed ? 422 : 502)).json({ success: false, safeToEdit: error.safeToEdit === true || error.status === 400, message: error.status ? error.message : authFailed ? 'Hostinger could not authenticate this mailbox. Check the email address and mailbox password in Mail settings.' : 'Unable to connect to Hostinger Mail. Please try again shortly.' });
       }
     };
   }
@@ -48,8 +48,10 @@ function createMailHandlers({ Account = MailAccount, Submission = MailSubmission
       if (!secret || secret.length > 1024) fail('Enter the password for this Hostinger mailbox.');
       const account = { email: normalizedEmail, displayName: displayName.trim(), password: secret, notificationsEnabled };
       // Verify receiving AND sending before replacing a working configuration. No email is sent.
-      await service.verify(account);
-      await Account.findOneAndUpdate({ user: req.user._id }, { $set: { email: account.email, displayName: account.displayName, notificationsEnabled, passwordEncrypted: encryptPassword(secret, req.user._id) } }, { upsert: true, runValidators: true });
+      const checkpoint = await service.verify(account);
+      const resetCheckpoint = existing?.email !== normalizedEmail || !!password || existing?.notificationsEnabled === false && notificationsEnabled;
+      const baseline = resetCheckpoint && Number.isSafeInteger(checkpoint?.nextUid) && checkpoint.nextUid >= 1 && /^\d{1,20}$/.test(checkpoint.validity) ? checkpoint : null;
+      await Account.findOneAndUpdate({ user: req.user._id }, { $set: { email: account.email, displayName: account.displayName, notificationsEnabled, passwordEncrypted: encryptPassword(secret, req.user._id), ...(resetCheckpoint ? { notificationPollAt: new Date() } : {}), ...(baseline ? { pushCheckpoint: baseline } : {}) }, ...(resetCheckpoint && !baseline ? { $unset: { pushCheckpoint: '' } } : {}) }, { upsert: true, runValidators: true });
       res.json({ success: true, settings: { ...publicSettings(account), serverConfigured: true } });
     }),
     disconnect: endpoint(async (req, res) => {
@@ -79,6 +81,14 @@ function createMailHandlers({ Account = MailAccount, Submission = MailSubmission
       const account = await accountFor(req);
       const fingerprint = crypto.createHash('sha256').update(JSON.stringify({ email: account.email, ...message })).digest('hex');
       const filter = { user: req.user._id, requestId };
+      let outgoing = message;
+      if (message.forward) {
+        const previous = await Submission.findOne(filter);
+        if (previous?.fingerprint === fingerprint && previous.status === 'sent') return res.json({ success: true, ...previous.result });
+        if (previous) fail('This send request is already being processed or its outcome is uncertain. Check Sent before sending again.', 409);
+        try { outgoing = await service.prepareForward(account, message); }
+        catch (error) { error.safeToEdit = true; throw error; }
+      }
       try { await Submission.create({ ...filter, fingerprint }); }
       catch (error) {
         if (error.code !== 11000) throw error;
@@ -87,7 +97,7 @@ function createMailHandlers({ Account = MailAccount, Submission = MailSubmission
         fail('This send request is already being processed or its outcome is uncertain. Check Sent or Hostinger webmail before sending again.', 409);
       }
       let result;
-      try { result = await service.send(account, message); }
+      try { result = await service.send(account, outgoing); }
       catch {
         await Submission.updateOne(filter, { $set: { status: 'uncertain' } });
         fail('Hostinger did not confirm this send. Check Sent or Hostinger webmail before sending again to avoid duplicates.', 502);

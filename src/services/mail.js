@@ -16,12 +16,18 @@ function recipients(value, required) {
   return [...new Set(values)];
 }
 function validateMessage(body) {
+  let forward;
+  if (body.forward !== undefined) {
+    const value = body.forward;
+    if (!value || typeof value !== 'object' || !['inbox', 'sent'].includes(value.folder) || typeof value.uid !== 'string' || !/^[1-9]\d{0,9}$/.test(value.uid) || Number(value.uid) > 4294967295 || typeof value.uidValidity !== 'string' || !/^\d{1,20}$/.test(value.uidValidity) || typeof value.includeAttachments !== 'boolean') fail('The forwarded message is invalid. Reopen it and try again.');
+    forward = { folder: value.folder, uid: value.uid, uidValidity: value.uidValidity, includeAttachments: value.includeAttachments };
+  }
   const to = recipients(body.to, true), cc = recipients(body.cc || '', false);
   if (to.length + cc.length > 20) fail('A message can have at most 20 recipients.');
   if (typeof body.subject !== 'string' || !body.subject.trim() || body.subject.length > 998 || /[\r\n]/.test(body.subject)) fail('Enter a subject of up to 998 characters.');
-  if (typeof body.text !== 'string' || !body.text.trim() || body.text.length > 100000) fail('Enter a message of up to 100,000 characters.');
+  if (typeof body.text !== 'string' || !forward && !body.text.trim() || body.text.length > 100000) fail('Enter a message of up to 100,000 characters.');
   // Sender and reply headers are constructed server-side, never accepted from the browser.
-  return { to, cc, subject: body.subject.trim(), text: body.text };
+  return { to, cc, subject: body.subject.trim(), text: body.text, ...(forward ? { forward } : {}) };
 }
 const summary = message => ({
   uid: message.uid,
@@ -60,10 +66,44 @@ function createMailService({ ImapClient = ImapFlow, createTransport = nodemailer
     return mailboxes.find(box => box.specialUse === '\\Sent')?.path || mailboxes.find(box => /^(INBOX[/.])?Sent( Items| Messages)?$/i.test(box.path))?.path || null;
   }
   return {
+    prepareForward: (account, message) => withImap(account, async client => {
+      const source = message.forward;
+      const path = await folderPath(client, source.folder);
+      if (!path) fail('Original message not found. Refresh the mailbox.', 404);
+      const lock = await client.getMailboxLock(path, { readOnly: true });
+      try {
+        if (String(client.mailbox.uidValidity) !== source.uidValidity) fail('Mailbox changed. Reopen the original message before forwarding.', 409);
+        const metadata = await client.fetchOne(source.uid, { size: true }, { uid: true });
+        if (!metadata) fail('Original message not found. Refresh the mailbox.', 404);
+        if (metadata.size > MAX_MESSAGE_SIZE) fail('This message is larger than 5 MB. Forward it from Hostinger webmail.', 413);
+        const original = await client.fetchOne(source.uid, { source: true }, { uid: true });
+        if (!original?.source) fail('Original message not found. Refresh the mailbox.', 404);
+        if (original.source.length > MAX_MESSAGE_SIZE) fail('This message is larger than 5 MB. Forward it from Hostinger webmail.', 413);
+        const parsed = await simpleParser(original.source, { skipHtmlToText: false, skipTextToHtml: true, skipImageLinks: true, maxHtmlLengthToParse: MAX_MESSAGE_SIZE });
+        const label = value => addresses(value?.value).map(item => item.name ? `${item.name} <${item.address}>` : item.address).join(', ');
+        const header = ['---------- Forwarded message ----------', `From: ${label(parsed.from)}`, ...(parsed.date && Number.isFinite(+parsed.date) ? [`Date: ${parsed.date.toUTCString()}`] : []), `Subject: ${parsed.subject || '(No subject)'}`, `To: ${label(parsed.to)}`, ...(parsed.cc?.value?.length ? [`Cc: ${label(parsed.cc)}`] : [])].join('\n');
+        const attachments = source.includeAttachments ? (parsed.attachments || []).map(item => ({
+          filename: String(item.filename || 'attachment').replace(/[\r\n\0]/g, '').split(/[\\/]/).pop().slice(0, 240) || 'attachment',
+          content: item.content,
+          contentType: /^[a-z\d!#$&^_.+-]+\/[a-z\d!#$&^_.+-]+$/i.test(item.contentType || '') ? item.contentType : 'application/octet-stream',
+          ...(item.contentId ? { cid: String(item.contentId).replace(/[<>\r\n\0]/g, '').slice(0, 255) } : {}),
+          contentDisposition: item.contentDisposition === 'inline' ? 'inline' : 'attachment',
+        })) : [];
+        const originalHtml = formatMailBody(parsed, attachments, { preserveCid: true }).html;
+        const { forward, ...outgoing } = message;
+        return { ...outgoing, text: `${message.text}${message.text ? '\n\n' : ''}${header}\n\n${parsed.text || ''}`,
+          html: `${plainTextHtml(message.text)}<br />${plainTextHtml(header)}<br />${originalHtml}`, attachments };
+      } finally { lock.release(); }
+    }),
+    checkpoint: account => withImap(account, async client => {
+      const status = await client.status('INBOX', { uidNext: true, uidValidity: true });
+      return { nextUid: Number(status.uidNext), validity: String(status.uidValidity) };
+    }),
     async verify(account) {
-      await withImap(account, client => client.status('INBOX', { messages: true }));
+      const status = await withImap(account, client => client.status('INBOX', { messages: true, uidNext: true, uidValidity: true }));
       const transport = smtp(account);
       try { await transport.verify(); } finally { transport.close(); }
+      return { nextUid: Number(status.uidNext), validity: String(status.uidValidity) };
     },
     status: account => withImap(account, async client => {
       const status = await client.status('INBOX', { messages: true, unseen: true });
@@ -98,7 +138,7 @@ function createMailService({ ImapClient = ImapFlow, createTransport = nodemailer
       } finally { lock.release(); }
     }),
     async send(account, message) {
-      const raw = await new MailComposer({ ...message, html: plainTextHtml(message.text), from: { name: account.displayName, address: account.email }, disableFileAccess: true, disableUrlAccess: true }).compile().build();
+      const raw = await new MailComposer({ ...message, html: message.html || plainTextHtml(message.text), from: { name: account.displayName, address: account.email }, disableFileAccess: true, disableUrlAccess: true }).compile().build();
       const transport = smtp(account);
       let info;
       try { info = await transport.sendMail({ envelope: { from: account.email, to: [...message.to, ...message.cc] }, raw }); }

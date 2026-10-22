@@ -5,6 +5,7 @@ const PushJob = require('../models/PushJob');
 const Message = require('../models/Message');
 const Conversation = require('../models/Conversation');
 const User = require('../models/User');
+const mongoose = require('mongoose');
 const { jwtSecret: secret } = require('./authSecret');
 const configured = () => !!(process.env.WEB_PUSH_VAPID_PUBLIC_KEY && process.env.WEB_PUSH_VAPID_PRIVATE_KEY && process.env.WEB_PUSH_SUBJECT);
 
@@ -19,7 +20,7 @@ async function deliverJob(id) {
       User.findOne({ _id: job.user, isActive: true }),
     ]);
     const conversation = message && await Conversation.findOne({ _id: message.conversation, 'members.user': job.user });
-    if (!subscription || !message || !user || !conversation || message.readBy.some((id) => String(id) === String(job.user))) {
+    if (!subscription || !message || !user || !conversation || +message.createdAt < Date.now() - 86400000 || message.readBy.some((id) => String(id) === String(job.user))) {
       await PushJob.updateOne({ _id: job._id }, { $set: { status: 'sent', leaseUntil: null } }); return;
     }
     const receiptToken = jwt.sign({ purpose: 'push-delivery', messageId: String(message._id), subscriptionId: String(subscription._id) }, secret(), { audience: 'chat-push-delivery', subject: String(job.user), expiresIn: '24h' });
@@ -64,4 +65,13 @@ async function flush(userId) {
   const filter = userId ? { user: userId } : {};
   await dispatchJobs(await PushJob.find({ ...filter, status: 'pending', nextAttemptAt: { $lte: new Date() } }).limit(50));
 }
-module.exports = { configured, notifyMessage, flush, secret };
+function start({ intervalMs = 20000 } = {}) {
+  let running, stopped = false;
+  const tick = () => {
+    if (stopped || running || !configured() || mongoose.connection.readyState !== 1) return;
+    running = flush().catch(error => console.warn('Background chat push will retry:', error.code || 'unavailable')).finally(() => { running = null; });
+  };
+  tick(); const timer = setInterval(tick, intervalMs); timer.unref();
+  return async () => { stopped = true; clearInterval(timer); await running; };
+}
+module.exports = { configured, notifyMessage, flush, secret, start };

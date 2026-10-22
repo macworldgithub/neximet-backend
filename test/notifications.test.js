@@ -182,3 +182,37 @@ test('push delivery retries, revalidates device ownership, skips read/withdrawn 
     await notifications.flush(); assert.equal(await Subscription.exists({ _id: subscription._id }), null); assert.equal((await PushJob.findById(expiredJob._id)).status, 'failed');
   } finally { webpush.sendNotification = original; delete process.env.WEB_PUSH_VAPID_PUBLIC_KEY; delete process.env.WEB_PUSH_VAPID_PRIVATE_KEY; delete process.env.WEB_PUSH_SUBJECT; }
 });
+
+test('chat retry worker delivers a queued message with no browser, socket, or flush request', async () => {
+  const webpush = require('web-push'), original = webpush.sendNotification, keys = webpush.generateVAPIDKeys();
+  process.env.WEB_PUSH_VAPID_PUBLIC_KEY = keys.publicKey; process.env.WEB_PUSH_VAPID_PRIVATE_KEY = keys.privateKey; process.env.WEB_PUSH_SUBJECT = 'https://example.test';
+  const ChatPush = require('../src/services/chatPush'); const Job = require('../src/models/PushJob'); let stop;
+  try {
+    const subscription = await Subscription.create({ user: users[2]._id, endpoint: 'https://fcm.googleapis.com/background-fixture', keys: { p256dh: 'test', auth: 'test' } });
+    const conversation = await require('../src/models/Conversation').create({ kind: 'group', name: 'Background fixture', createdBy: users[0]._id, members: [{ user: users[0]._id }, { user: users[2]._id }] });
+    const message = await require('../src/models/Message').create({ conversation: conversation._id, sender: users[0]._id, sequence: 1, clientId: 'background-fixture', text: 'A background test message', readBy: [users[0]._id] });
+    const job = await Job.create({ message: message._id, subscription: subscription._id, user: users[2]._id });
+    let attempts = 0;
+    webpush.sendNotification = async () => { if (++attempts === 1) throw Object.assign(Error('Temporary failure'), { statusCode: 503 }); };
+    stop = ChatPush.start({ intervalMs: 20 });
+    const waitFor = async predicate => { for (let i = 0; i < 100; i++) { if (await predicate()) return; await new Promise(resolve => setTimeout(resolve, 20)); } throw Error('Background worker did not progress'); };
+    await waitFor(async () => (await Job.findById(job._id)).attempts === 1);
+    await Job.updateOne({ _id: job._id }, { $set: { nextAttemptAt: new Date(0) } });
+    await waitFor(async () => (await Job.findById(job._id)).status === 'sent'); assert.equal(attempts, 2);
+  } finally { await stop?.(); webpush.sendNotification = original; delete process.env.WEB_PUSH_VAPID_PUBLIC_KEY; delete process.env.WEB_PUSH_VAPID_PRIVATE_KEY; delete process.env.WEB_PUSH_SUBJECT; }
+});
+
+test('mail scanner persists its checkpoint and owner inbox event without an open app', async () => {
+  const Account = require('../src/models/MailAccount'); const { createMailNotifications } = require('../src/services/mailNotifications');
+  const account = await Account.create({ user: users[4]._id, email: 'mail-owner@example.test', passwordEncrypted: 'synthetic-encrypted' });
+  let nextUid = 5;
+  const worker = createMailNotifications({ service: { checkpoint: async () => ({ nextUid, validity: '123' }) }, decrypt: () => 'synthetic' });
+  await worker.flush();
+  assert.equal((await Account.findById(account._id).select('+pushCheckpoint.nextUid')).pushCheckpoint.nextUid, 5);
+  nextUid = 6; await Account.updateOne({ _id: account._id }, { $set: { notificationPollAt: new Date(0) } }); await worker.flush();
+  const event = await Notification.findOne({ key: `mail:${account._id}:123:6` }); assert.ok(event); assert.equal(String(event.user), String(users[4]._id));
+  const inbox = (await request(4, '/notifications')).body.notifications.find(item => item._id === String(event._id));
+  assert.equal(inbox.url, '/mail'); assert.equal('mailboxEmail' in inbox, false);
+  assert.equal((await request(2, '/notifications')).body.notifications.some(item => item._id === String(event._id)), false);
+  await Account.deleteOne({ _id: account._id });
+});
