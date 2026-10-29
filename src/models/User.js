@@ -22,7 +22,7 @@ const userSchema = new mongoose.Schema({
   },
   role: {
     type: String,
-    enum: ['CEO', 'Super Admin', 'Project Manager', 'Team Manager', 'Team Member'],
+    enum: ['CEO', 'Super Admin', 'Project Manager', 'Team Manager', 'Team Member', 'Client'],
     default: 'Team Member',
   },
   department: {
@@ -40,6 +40,8 @@ const userSchema = new mongoose.Schema({
     type: String,
     default: 'Specialist',
   },
+  company: { type: String, trim: true, maxlength: 160, default: '' },
+  billingAddress: { type: String, maxlength: 1000, default: '' },
   baseSalary: {
     type: Number,
     default: null,

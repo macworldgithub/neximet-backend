@@ -34,6 +34,8 @@ const commentSchema = new mongoose.Schema({
 });
 
 const taskSchema = new mongoose.Schema({
+  clientVisible: { type: Boolean, default: false },
+  clientRequested: { type: Boolean, default: false },
   project: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Project',

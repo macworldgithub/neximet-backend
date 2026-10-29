@@ -6,6 +6,7 @@ const chatMedia = require('../services/chatMedia');
 const chatAttachments = require('../services/chatAttachments');
 const { pipeline } = require('node:stream/promises');
 
+const { executive, validateContacts } = require('../services/clientAccess');
 const publicUser = '_id name department role isActive';
 const validId = (id) => typeof id === 'string' && /^[a-f\d]{24}$/i.test(id);
 const fail = (status, message) => Object.assign(new Error(message), { status });
@@ -33,7 +34,7 @@ function serializeMessage(message) {
 }
 
 exports.getPeople = wrap(async (req, res) => {
-  const people = await User.find({ isActive: true, _id: { $ne: req.user._id } }).select(publicUser).sort({ name: 1 }).lean();
+  const people = await User.find({ isActive: true, _id: { $ne: req.user._id }, ...(req.user.role === 'Client' ? { role: { $in: ['CEO', 'Super Admin'] } } : !executive(req.user) ? { role: { $ne: 'Client' } } : {}) }).select(publicUser).sort({ name: 1 }).lean();
   res.json({ success: true, people });
 });
 
@@ -69,6 +70,7 @@ exports.createConversation = wrap(async (req, res) => {
   }
   if (kind === 'group' && (typeof name !== 'string' || !name.trim() || name.trim().length > 80)) throw fail(400, 'Group name must be 1–80 characters');
   if (await User.countDocuments({ _id: { $in: ids }, isActive: true }) !== ids.length) throw fail(400, 'One or more teammates are unavailable');
+  await validateContacts(req.user, ids);
   const allIds = [...ids, String(req.user._id)].sort();
   const data = { kind, members: allIds.map((user) => ({ user })), createdBy: req.user._id, ...(kind === 'group' ? { name: name.trim() } : { directKey: allIds.join(':') }) };
   let conversation;
@@ -87,6 +89,24 @@ exports.createConversation = wrap(async (req, res) => {
 
 exports.getConversation = wrap(async (req, res) => {
   res.json({ success: true, conversation: await populateConversation(await membership(req)) });
+});
+
+exports.addMembers = wrap(async (req, res) => {
+  if (!executive(req.user)) throw fail(403, 'Only CEOs and Super Admins can add conversation members');
+  const conversation = await membership(req);
+  if (conversation.purpose === 'meeting') throw fail(400, 'Use meeting invitations for meeting rooms');
+  const ids = req.body.participantIds;
+  if (!Array.isArray(ids) || !ids.length || ids.length > 49 || ids.some(id => !validId(id))) throw fail(400, 'Choose valid members');
+  const existing = conversation.members.map(member => String(member.user));
+  const added = [...new Set(ids.map(id => id.toLowerCase()))].filter(id => !existing.includes(id));
+  if (existing.length + added.length > 50) throw fail(400, 'Conversations support up to 50 members');
+  await validateContacts(req.user, added);
+  // One atomic update avoids duplicate membership under concurrent invitations.
+  const updated = await Conversation.findOneAndUpdate({ _id: conversation._id, 'members.user': req.user._id, ...(added.length ? { $nor: [{ 'members.user': { $in: added } }] } : {}), $expr: { $lte: [{ $add: [{ $size: '$members' }, added.length] }, 50] } },
+    { $addToSet: { members: { $each: added.map(user => ({ user, typingUntil: null })) } }, $set: { kind: 'group', name: conversation.name || 'Client conversation' }, $unset: { directKey: 1 } }, { new: true });
+  if (!updated) throw fail(409, 'Conversation changed. Refresh and try again');
+  await publish(updated, 'chat:conversation', { conversationId: String(updated._id) });
+  res.json({ success: true, conversation: await populateConversation(updated) });
 });
 
 exports.getDeliveries = wrap(async (req, res) => {

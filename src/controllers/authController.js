@@ -39,7 +39,7 @@ exports.login = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Please provide an email and password' });
     }
 
-    const user = await User.findOne({ email }).select('+password');
+    const user = await User.findOne({ email: String(email).trim().toLowerCase() }).select('+password');
     if (!user) {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
@@ -49,6 +49,7 @@ exports.login = async (req, res) => {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
+    if (!user.isActive) return res.status(401).json({ success: false, message: 'Your account is inactive. Contact your administrator.' });
     const token = generateToken(user._id);
     req.user = user;
     protectPayroll(req, res);
@@ -104,9 +105,9 @@ exports.getMe = async (req, res) => {
 exports.getAllUsers = async (req, res) => {
   try {
     const { department, role } = req.query;
-    const filter = {};
+    const filter = { role: { $ne: 'Client' } };
     if (department && department !== 'All') filter.department = department;
-    if (role && role !== 'All') filter.role = role;
+    if (role && role !== 'All' && role !== 'Client') filter.role = role;
 
     const users = await User.find(filter)
       .select('-password')

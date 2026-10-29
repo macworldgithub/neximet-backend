@@ -10,7 +10,7 @@ const { leaveCoverage, attendanceSchedule } = require('./leavePolicy');
 // retrospective monetary charges. Unique user/day upserts make concurrent reads safe.
 async function materializeHistory(rule, filter = {}, now = new Date()) {
   const today = companyDate(now);
-  const people = await User.find({ ...(filter.user ? { _id: filter.user } : {}), $or: [{ isActive: true }, { deactivatedAt: { $type: 'date' } }] }).select('_id role joinDate createdAt dailyWage baseSalary isActive deactivatedAt attendanceCalendarThrough attendanceCalendarRevision attendanceTrackingFrom employmentGaps').lean();
+  const people = await User.find({ role: { $ne: 'Client' }, ...(filter.user ? { _id: filter.user } : {}), $or: [{ isActive: true }, { deactivatedAt: { $type: 'date' } }] }).select('_id role joinDate createdAt dailyWage baseSalary isActive deactivatedAt attendanceCalendarThrough attendanceCalendarRevision attendanceTrackingFrom employmentGaps').lean();
   let requestedStart = filter.date?.$gte, requestedEnd = filter.date?.$lte || today;
   if (filter.date?.$regex) { const month = filter.date.$regex.slice(1); requestedStart = [requestedStart, month + '-01'].filter(Boolean).sort().at(-1); const next = new Date(month + '-01T00:00:00Z'); next.setUTCMonth(next.getUTCMonth() + 1); requestedEnd = [requestedEnd, addDays(next.toISOString().slice(0, 10), -1)].sort()[0]; }
   requestedEnd = [requestedEnd, today].sort()[0];

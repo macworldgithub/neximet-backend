@@ -46,7 +46,7 @@ async function dayExemptions(date, userIds, rule, transaction) {
 
 async function dailyRoster(date = companyDate(), department) {
   const rule = await activeRule();
-  const candidates = await User.find({ $or: [{ isActive: true }, { deactivatedAt: { $gte: atCompanyTime(date, '00:00') } }], ...(department ? { department } : {}) }).select('name email role department designation baseSalary dailyWage phone joinDate createdAt isActive deactivatedAt attendanceTrackingFrom employmentGaps').lean();
+  const candidates = await User.find({ role: { $ne: 'Client' }, $or: [{ isActive: true }, { deactivatedAt: { $gte: atCompanyTime(date, '00:00') } }], ...(department ? { department } : {}) }).select('name email role department designation baseSalary dailyWage phone joinDate createdAt isActive deactivatedAt attendanceTrackingFrom employmentGaps').lean();
   const users = candidates.filter(user => date >= companyDate(user.joinDate || user.createdAt) && (!user.attendanceTrackingFrom || date >= companyDate(user.attendanceTrackingFrom)) && !user.employmentGaps?.some(gap => date > companyDate(gap.start) && date < companyDate(gap.end)));
   const ids = users.map(user => user._id);
   const [records, exemptions, photos] = await Promise.all([

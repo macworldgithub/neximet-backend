@@ -29,7 +29,7 @@ router.post('/', async (req, res, next) => {
     if (!executive(req.user)) return res.status(403).json({ success: false, message: 'Only CEOs and Super Admins can publish announcements.' });
     const { title, body, audience = 'everyone', priority = 'normal', department, userIds } = req.body;
     if (typeof title !== 'string' || !title.trim() || title.trim().length > 160 || typeof body !== 'string' || !body.trim() || body.trim().length > 10000 || !['everyone', 'department', 'users'].includes(audience) || !['normal', 'important'].includes(priority)) return res.status(400).json({ success: false, message: 'Provide a title (up to 160 characters), announcement (up to 10,000 characters), and valid audience/priority.' });
-    const filter = { isActive: true };
+    const filter = { isActive: true, role: { $ne: 'Client' } };
     if (audience === 'department') {
       if (!User.schema.path('department').enumValues.includes(department)) return res.status(400).json({ success: false, message: 'Select a valid department.' });
       filter.department = department;

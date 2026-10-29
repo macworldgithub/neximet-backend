@@ -26,6 +26,7 @@ router.get('/people', chat.getPeople);
 router.get('/conversations', chat.listConversations);
 router.post('/conversations', chat.createConversation);
 router.get('/conversations/:id', chat.getConversation);
+router.post('/conversations/:id/members', chat.addMembers);
 router.get('/conversations/:id/messages', chat.getMessages);
 router.post('/conversations/:id/messages', chat.authorizeUpload, (req, res, next) => upload(req, res, (error) => {
   if (error) return res.status(400).json({ success: false, message: error.code === 'LIMIT_FILE_SIZE' ? 'Attachments must total 100 MB or smaller per message' : ['LIMIT_FILE_COUNT', 'LIMIT_UNEXPECTED_FILE', 'LIMIT_PART_COUNT'].includes(error.code) ? `Attach up to ${MAX_FILES} files per message` : error.message });

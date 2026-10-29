@@ -27,6 +27,12 @@ const protect = async (req, res, next) => {
     }
 
     protectPayroll(req, res);
+    if (req.user.role === 'Client') {
+      const path = req.originalUrl.split('?')[0];
+      if (!/^\/api\/(portal(?:\/|$)|chat(?:\/|$)|meetings(?:\/|$)|notifications(?:\/|$)|auth\/(?:me|profile)$)/.test(path)) {
+        return res.status(403).json({ success: false, message: 'This area is available to Neximet staff only.' });
+      }
+    }
     next();
   } catch (err) {
     if (err.status === 503) return res.status(503).json({ success: false, message: err.message });

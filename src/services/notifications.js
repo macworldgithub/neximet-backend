@@ -27,7 +27,7 @@ async function safely(event) {
   try { await notify(event); } catch (error) { console.error('Notification persistence failed:', error.message); }
 }
 async function executives() { return User.find({ isActive: true, role: { $in: ['CEO', 'Super Admin'] } }).distinct('_id'); }
-async function everyone() { return User.find({ isActive: true }).distinct('_id'); }
+async function everyone() { return User.find({ isActive: true, role: { $ne: 'Client' } }).distinct('_id'); }
 async function announcementPublished(announcement) {
   await notify({ key: `announcement:${announcement._id}`, users: announcement.recipients, actor: announcement.author, kind: 'announcement',
     title: announcement.priority === 'important' ? 'Important announcement' : 'New announcement', body: announcement.title,

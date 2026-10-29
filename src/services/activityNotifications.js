@@ -18,7 +18,7 @@ async function task(task, actor, action = 'updated', previousAssignee) {
     // Match the project's existing read policy before notifying watchers.
     const ids = candidates.map(idOf).filter(id => /^[a-f\d]{24}$/i.test(id));
     const members = projectPeople(project).map(idOf);
-    const people = await User.find({ _id: { $in: ids }, isActive: true, $or: [
+    const people = await User.find({ _id: { $in: ids }, isActive: true, role: { $ne: 'Client' }, $or: [
       { role: { $in: ['CEO', 'Super Admin'] } }, { department: project.department }, { department: 'Executive' }, { _id: { $in: members.filter(id => /^[a-f\d]{24}$/i.test(id)) } },
     ] }).distinct('_id');
     await notifications.notify({ key: `task:${idOf(task)}:${randomUUID()}`, users: people, actor, kind: 'task',

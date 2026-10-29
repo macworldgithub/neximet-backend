@@ -45,6 +45,7 @@ function createApp({ config = runtimeConfig(), connect = connectDB, database = m
   app.use('/uploads', (req, res) => res.status(404).json({ success: false, message: 'File not found.' }));
 
   // Routes
+  app.use('/api/portal', require('./routes/portalRoutes'));
   app.use('/api/auth', require('./routes/authRoutes'));
   app.use('/api/projects', require('./routes/projectRoutes'));
   app.use('/api/tasks', require('./routes/taskRoutes'));
