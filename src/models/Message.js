@@ -14,6 +14,13 @@ const schema = new mongoose.Schema({
     mimeType: String,
     data: { type: Buffer, select: false },
   },
+  attachments: [{
+    _id: false,
+    name: String,
+    size: Number,
+    mimeType: String,
+    fileId: { type: mongoose.Schema.Types.ObjectId, select: false },
+  }],
 }, { timestamps: true });
 schema.index({ conversation: 1, sequence: 1 }, { unique: true });
 schema.index({ conversation: 1, sender: 1, clientId: 1 }, { unique: true });

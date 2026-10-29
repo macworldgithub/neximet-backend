@@ -207,15 +207,80 @@ test('files persist privately, can be downloaded by recipients and reject unsupp
   assert.equal(download.headers.get('x-content-type-options'), 'nosniff');
   assert.equal((await request(carol, `/conversations/${direct}/messages/${id}/attachment`)).status, 404);
   assert.ok((await request(bob, `/conversations/${direct}/messages`)).body.messages.every((message) => !message.attachment?.data));
-  for (const [name, content] of [['script.html', 'bad'], ['huge.txt', 'x'.repeat(3 * 1024 * 1024 + 1)]]) {
+  for (const [name, content] of [['script.html', 'bad'], ['huge.txt', Buffer.alloc(100 * 1024 * 1024 + 1)]]) {
     const upload = new FormData(); upload.append('clientId', 'invalid-file-test'); upload.append('attachment', new Blob([content]), name);
     assert.equal((await request(alice, `/conversations/${direct}/messages`, upload)).status, 400);
   }
 });
 
+test('multiple attachments keep their order, private downloads, previews and retry cleanup', async () => {
+  const files = mongoose.connection.db.collection('chatAttachments.files');
+  const beforeCount = await files.countDocuments();
+  const form = () => {
+    const body = new FormData(); body.append('clientId', 'multi-attachment-retry'); body.append('text', 'Two files');
+    body.append('attachment', new Blob(['first file']), 'first.txt');
+    body.append('attachment', new Blob([Buffer.from('89504e470d0a1a0a00000000', 'hex')]), 'second.png');
+    return body;
+  };
+  const responses = await Promise.all([request(alice, `/conversations/${direct}/messages`, form()), request(alice, `/conversations/${direct}/messages`, form())]);
+  for (const response of responses) {
+    assert.equal(response.status, 201, JSON.stringify(response.body));
+    assert.equal(response.body.message._id, responses[0].body.message._id);
+    assert.deepEqual(response.body.message.attachments.map(file => file.name), ['first.txt', 'second.png']);
+    assert.ok(response.body.message.attachments.every(file => !file.data && !file.fileId));
+  }
+  assert.equal(await files.countDocuments(), beforeCount + 2, 'retries must not leave duplicate files');
+  const endpoint = `/conversations/${direct}/messages/${responses[0].body.message._id}/attachment`;
+  assert.equal(Buffer.from((await request(bob, `${endpoint}?index=0`)).body).toString(), 'first file');
+  assert.equal((await request(bob, `${endpoint}?index=1&preview=1`)).headers.get('content-type'), 'image/png');
+  assert.equal((await request(carol, `${endpoint}?index=1`)).status, 404);
+  for (const index of ['-1', '1.5', '2', 'bad']) assert.ok([400, 404].includes((await request(bob, `${endpoint}?index=${index}`)).status));
+  const inbox = (await request(bob, '/conversations')).body.conversations.find(chat => chat._id === direct);
+  assert.deepEqual(inbox.lastMessage.attachments.map(file => file.name), ['first.txt', 'second.png']);
+  const stored = await Message.findById(responses[0].body.message._id).lean();
+  assert.ok(stored.attachments.every(file => !file.fileId && !file.data));
+});
+
+test('the maximum 20-file batch accepts both message fields and every attachment', async () => {
+  const form = new FormData(); form.append('clientId', 'twenty-file-boundary'); form.append('text', 'All twenty files');
+  for (let index = 0; index < 20; index++) form.append('attachment', new Blob([String(index)]), `${index}.txt`);
+  const response = await request(alice, `/conversations/${direct}/messages`, form);
+  assert.equal(response.status, 201, JSON.stringify(response.body));
+  assert.deepEqual(response.body.message.attachments.map(file => file.name), Array.from({ length: 20 }, (_, index) => `${index}.txt`));
+  const last = await request(bob, `/conversations/${direct}/messages/${response.body.message._id}/attachment?index=19`);
+  assert.equal(Buffer.from(last.body).toString(), '19');
+});
+
+test('100 MB files persist outside message documents, while oversized batches and excess counts clean up', async () => {
+  const limit = 100 * 1024 * 1024;
+  const content = Buffer.alloc(limit, 65); content.write('100 MB boundary');
+  const form = new FormData(); form.append('clientId', 'hundred-megabyte-boundary');
+  form.append('attachment', new Blob([content]), 'large.txt');
+  const sent = await request(alice, `/conversations/${direct}/messages`, form);
+  assert.equal(sent.status, 201, JSON.stringify(sent.body));
+  assert.equal(sent.body.message.attachments[0].size, limit);
+  const downloaded = await request(bob, `/conversations/${direct}/messages/${sent.body.message._id}/attachment`);
+  assert.equal(downloaded.status, 200); assert.deepEqual(Buffer.from(downloaded.body), content);
+  const files = mongoose.connection.db.collection('chatAttachments.files');
+  const chunks = mongoose.connection.db.collection('chatAttachments.chunks');
+  const expected = [await files.countDocuments(), await chunks.countDocuments()];
+  const oversized = new FormData(); oversized.append('clientId', 'oversized-file-batch');
+  oversized.append('attachment', new Blob([Buffer.alloc(51 * 1024 * 1024)]), 'one.txt');
+  oversized.append('attachment', new Blob([Buffer.alloc(50 * 1024 * 1024)]), 'two.txt');
+  const rejected = await request(alice, `/conversations/${direct}/messages`, oversized);
+  assert.equal(rejected.status, 400); assert.match(rejected.body.message, /100 MB/);
+  for (const mode of ['count', 'validation', 'type']) {
+    const invalid = new FormData(); invalid.append('clientId', mode === 'validation' ? 'bad' : `invalid-${mode}-batch`);
+    for (let index = 0; index < (mode === 'count' ? 21 : 2); index++) invalid.append('attachment', new Blob(['x']), mode === 'type' && index === 1 ? 'bad.html' : `${index}.txt`);
+    assert.equal((await request(alice, `/conversations/${direct}/messages`, invalid)).status, 400);
+    assert.deepEqual([await files.countDocuments(), await chunks.countDocuments()], expected, `${mode} must not orphan files or chunks`);
+  }
+  assert.deepEqual([await files.countDocuments(), await chunks.countDocuments()], expected);
+});
+
 test('images and videos preview privately using detected bytes rather than the supplied MIME type', async () => {
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7foAAAAASUVORK5CYII=', 'base64');
-  const mp4 = Buffer.alloc(3 * 1024 * 1024 + 128); mp4.writeUInt32BE(24, 0); mp4.write('ftypisom', 4);
+  const mp4 = Buffer.alloc(16 * 1024 * 1024 + 128); mp4.writeUInt32BE(24, 0); mp4.write('ftypisom', 4);
   for (const [name, data, type] of [['photo.png', png, 'image/png'], ['clip.mp4', mp4, 'video/mp4']]) {
     const form = new FormData(); form.append('clientId', `media-${name.replace('.', '-')}`);
     form.append('attachment', new Blob([data], { type: 'text/html' }), name);
@@ -235,7 +300,7 @@ test('images and videos preview privately using detected bytes rather than the s
   }
 });
 
-test('old media previews safely and invalid or oversized media keeps its download fallback', async () => {
+test('legacy media previews safely and unrecognized media is rejected', async () => {
   const legacy = await Message.create({ conversation: direct, sender: alice._id, sequence: 999, clientId: 'legacy-media', attachment: { name: 'old-photo.png', mimeType: 'application/octet-stream', size: 12, data: Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0]) } });
   const endpoint = `/conversations/${direct}/messages/${legacy._id}/attachment`;
   assert.equal((await request(bob, `${endpoint}?preview=1`)).headers.get('content-type'), 'image/png');
@@ -243,7 +308,7 @@ test('old media previews safely and invalid or oversized media keeps its downloa
   assert.equal((await request(bob, `${endpoint}?preview=1`)).status, 415);
   const fallback = await request(bob, endpoint);
   assert.equal(fallback.status, 200); assert.equal(fallback.headers.get('content-type'), 'application/octet-stream');
-  for (const [name, content] of [['fake.png', '<html>not a photo</html>'], ['fake.mp4', 'not a video'], ['large.png', Buffer.alloc(3 * 1024 * 1024 + 1)], ['large.webm', Buffer.alloc(12 * 1024 * 1024 + 1)]]) {
+  for (const [name, content] of [['fake.png', '<html>not a photo</html>'], ['fake.mp4', 'not a video']]) {
     const form = new FormData(); form.append('clientId', `rejected-${name.replace('.', '-')}`); form.append('attachment', new Blob([content]), name);
     const result = await request(alice, `/conversations/${direct}/messages`, form);
     assert.equal(result.status, 400); assert.doesNotMatch(result.body.message, /request ID/);

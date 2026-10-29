@@ -24,7 +24,7 @@ async function deliverJob(id) {
       await PushJob.updateOne({ _id: job._id }, { $set: { status: 'sent', leaseUntil: null } }); return;
     }
     const receiptToken = jwt.sign({ purpose: 'push-delivery', messageId: String(message._id), subscriptionId: String(subscription._id) }, secret(), { audience: 'chat-push-delivery', subject: String(job.user), expiresIn: '24h' });
-    const payload = { userId: String(job.user), title: conversation.kind === 'group' ? `${message.sender?.name || 'Teammate'} · ${conversation.name}` : message.sender?.name || 'New message', body: (message.text || `Sent ${message.attachment?.name || 'an attachment'}`).slice(0, 180), conversationId: String(conversation._id), url: `/chat?conversation=${conversation._id}`, receiptToken };
+    const payload = { userId: String(job.user), title: conversation.kind === 'group' ? `${message.sender?.name || 'Teammate'} · ${conversation.name}` : message.sender?.name || 'New message', body: (message.text || `Sent ${message.attachments?.length > 1 ? `${message.attachments.length} attachments` : message.attachments?.[0]?.name || message.attachment?.name || 'an attachment'}`).slice(0, 180), conversationId: String(conversation._id), url: `/chat?conversation=${conversation._id}`, receiptToken };
     await webpush.sendNotification({ endpoint: subscription.endpoint, keys: subscription.keys }, JSON.stringify(payload), {
       TTL: 86400, urgency: 'high', timeout: 5000,
       vapidDetails: { subject: process.env.WEB_PUSH_SUBJECT, publicKey: process.env.WEB_PUSH_VAPID_PUBLIC_KEY, privateKey: process.env.WEB_PUSH_VAPID_PRIVATE_KEY },

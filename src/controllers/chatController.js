@@ -3,12 +3,17 @@ const Message = require('../models/Message');
 const User = require('../models/User');
 const { publish } = require('../services/chatEvents');
 const chatMedia = require('../services/chatMedia');
+const chatAttachments = require('../services/chatAttachments');
+const { pipeline } = require('node:stream/promises');
 
 const publicUser = '_id name department role isActive';
 const validId = (id) => typeof id === 'string' && /^[a-f\d]{24}$/i.test(id);
 const fail = (status, message) => Object.assign(new Error(message), { status });
 const wrap = (handler) => async (req, res, next) => {
-  try { await handler(req, res); } catch (error) { next(error); }
+  try { await handler(req, res); } catch (error) {
+    if (req.files?.length) await chatAttachments.discardUnused(req.files).catch(cleanup => console.warn('Chat attachment cleanup failed:', cleanup.message));
+    next(error);
+  }
 };
 async function membership(req) {
   if (!validId(req.params.id)) throw fail(400, 'Invalid conversation');
@@ -22,6 +27,8 @@ async function populateConversation(conversation) {
 function serializeMessage(message) {
   const value = message.toObject ? message.toObject() : message;
   if (value.attachment) delete value.attachment.data;
+  for (const attachment of value.attachments || []) delete attachment.fileId;
+  if (!value.attachment?.name && value.attachments?.length === 1) value.attachment = value.attachments[0];
   return value;
 }
 
@@ -41,7 +48,7 @@ exports.listConversations = wrap(async (req, res) => {
     { $lookup: { from: Message.collection.name, let: { chat: '$_id' }, pipeline: [
       { $match: { $expr: { $eq: ['$conversation', '$$chat'] } } },
       { $sort: { sequence: -1 } }, { $limit: 1 },
-      { $project: { text: 1, sender: 1, sequence: 1, createdAt: 1, 'attachment.name': 1 } },
+      { $project: { text: 1, sender: 1, sequence: 1, createdAt: 1, 'attachment.name': 1, 'attachments.name': 1 } },
     ], as: 'latest' } },
     { $set: { unreadCount: { $ifNull: [{ $arrayElemAt: ['$unread.count', 0] }, 0] }, lastMessage: { $arrayElemAt: ['$latest', 0] } } },
     { $unset: ['myMembership', 'unread', 'latest', 'directKey'] },
@@ -103,25 +110,30 @@ exports.getMessages = wrap(async (req, res) => {
   res.json({ success: true, messages: messages.map(serializeMessage), hasMore, conversation });
 });
 
+exports.authorizeUpload = async (req, res, next) => {
+  try { req.chatConversation = await membership(req); next(); } catch (error) { next(error); }
+};
+
 exports.sendMessage = wrap(async (req, res) => {
   await Message.init();
-  const conversation = await membership(req);
+  const conversation = req.chatConversation || await membership(req);
   const { text = '', clientId } = req.body;
-  if (typeof text !== 'string' || text.trim().length > 4000 || (!text.trim() && !req.file)) throw fail(400, 'Enter a message (up to 4,000 characters) or attach a file');
+  if (typeof text !== 'string' || text.trim().length > 4000 || (!text.trim() && !req.files?.length)) throw fail(400, 'Enter a message (up to 4,000 characters) or attach a file');
   if (typeof clientId !== 'string' || !/^[a-zA-Z0-9_-]{8,100}$/.test(clientId)) throw fail(400, 'Invalid message request ID');
   const key = { conversation: conversation._id, sender: req.user._id, clientId };
   let message = await Message.findOne(key);
   if (!message) {
-    const attachment = req.file ? chatMedia.attachment(req.file) : undefined;
+    const attachments = (req.files || []).map(({ name, size, mimeType, fileId }) => ({ name, size, mimeType, fileId }));
     const sequence = await Conversation.findByIdAndUpdate(conversation._id, { $inc: { nextSequence: 1 } }, { new: true });
     try {
-      message = await Message.create({ ...key, sequence: sequence.nextSequence, text: text.trim(), attachment, readBy: [req.user._id], deliveredBy: [req.user._id] });
+      message = await Message.create({ ...key, sequence: sequence.nextSequence, text: text.trim(), attachments, readBy: [req.user._id], deliveredBy: [req.user._id] });
     } catch (error) {
       if (error.code !== 11000) throw error;
       message = await Message.findOne(key);
       if (!message) throw error;
     }
   }
+  if (req.files?.length) await chatAttachments.discardUnused(req.files);
   // Repair activity metadata on retries too, after the durable message write.
   await Conversation.updateOne({ _id: conversation._id, 'members.user': req.user._id }, { $max: { lastActivityAt: message.createdAt }, $set: { 'members.$.typingUntil': null } });
   await message.populate('sender', publicUser);
@@ -157,14 +169,25 @@ exports.setTyping = wrap(async (req, res) => {
 exports.downloadAttachment = wrap(async (req, res) => {
   const conversation = await membership(req);
   if (!validId(req.params.messageId)) throw fail(400, 'Invalid message');
-  const message = await Message.findOne({ _id: req.params.messageId, conversation: conversation._id }).select('+attachment.data');
-  if (!message?.attachment?.data) throw fail(404, 'Attachment not found');
+  const message = await Message.findOne({ _id: req.params.messageId, conversation: conversation._id }).select('+attachment.data +attachments.fileId');
+  const index = req.query.index === undefined ? 0 : Number(req.query.index);
+  if (!Number.isSafeInteger(index) || index < 0) throw fail(400, 'Invalid attachment');
+  const attachment = message?.attachments?.length ? message.attachments[index] : index === 0 ? message?.attachment : null;
+  if (!attachment || (!attachment.fileId && !attachment.data)) throw fail(404, 'Attachment not found');
+  let prefix = attachment.data;
+  if (attachment.fileId) {
+    const stored = await chatAttachments.bucket().find({ _id: attachment.fileId }).next();
+    if (!stored) throw fail(404, 'Attachment not found');
+    const chunk = await require('mongoose').connection.db.collection('chatAttachments.chunks').findOne({ files_id: attachment.fileId, n: 0 });
+    prefix = chunk ? Buffer.from(chunk.data.buffer) : Buffer.alloc(0);
+  }
   const preview = req.query.preview === '1';
-  const type = preview ? chatMedia.mediaType(message.attachment.data) : null;
+  const type = preview ? chatMedia.mediaType(prefix) : null;
   if (preview && !type) throw fail(415, 'This attachment cannot be previewed. Download it to open it on your device.');
   res.setHeader('Cache-Control', 'private, no-store');
   res.setHeader('Content-Type', type || 'application/octet-stream');
   res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Content-Disposition', `${preview ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(message.attachment.name)}`);
-  res.send(message.attachment.data);
+  res.setHeader('Content-Disposition', `${preview ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(attachment.name)}`);
+  if (attachment.fileId) await pipeline(chatAttachments.bucket().openDownloadStream(attachment.fileId), res);
+  else res.send(attachment.data);
 });

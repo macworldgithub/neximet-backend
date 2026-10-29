@@ -1,6 +1,7 @@
 const path = require('node:path');
-const VIDEO_LIMIT = 12 * 1024 * 1024;
-const FILE_LIMIT = 3 * 1024 * 1024;
+const FILE_LIMIT = 100 * 1024 * 1024;
+const VIDEO_LIMIT = FILE_LIMIT;
+const MAX_FILES = 20;
 const images = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 const videos = new Set(['.mp4', '.m4v', '.mov', '.webm']);
 function mediaType(data) {
@@ -20,9 +21,9 @@ function mediaType(data) {
 function attachment(file) {
   const extension = path.extname(file.originalname).toLowerCase();
   const video = videos.has(extension), image = images.has(extension);
-  if (file.size > (video ? VIDEO_LIMIT : FILE_LIMIT)) throw Object.assign(Error(video ? 'Videos must be 12 MB or smaller' : 'Images and files must be 3 MB or smaller'), { status: 400 });
+  if (file.size > FILE_LIMIT) throw Object.assign(Error('Attachments must total 100 MB or smaller per message'), { status: 400 });
   const detected = mediaType(file.buffer);
   if ((image && !detected?.startsWith('image/')) || (video && !detected?.startsWith('video/'))) throw Object.assign(Error('This media file could not be recognized. Use a valid PNG, JPEG, GIF, WebP, MP4, MOV, or WebM file.'), { status: 400 });
   return { name: file.originalname.replace(/[\r\n\x00]/g, '').slice(0, 200), size: file.size, mimeType: detected || file.mimetype, data: file.buffer };
 }
-module.exports = { attachment, mediaType, videos, VIDEO_LIMIT, FILE_LIMIT };
+module.exports = { attachment, mediaType, videos, VIDEO_LIMIT, FILE_LIMIT, MAX_FILES };
