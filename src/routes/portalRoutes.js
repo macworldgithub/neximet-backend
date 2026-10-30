@@ -16,6 +16,13 @@ const wrap = handler => async (req, res, next) => { try { await handler(req, res
 const admin = authorize('CEO', 'Super Admin');
 const clientFields = 'name email company billingAddress phone isActive createdAt';
 const taskFields = '_id project title description status priority deadline createdAt clientVisible clientRequested';
+const projectFields = 'title description code client clientName clientRequested status completionPercentage startDate deadline milestones._id milestones.title milestones.deadline milestones.status milestones.progress';
+const departments = ['Software Development', 'Digital Marketing (SEO)', 'Graphics Designing', 'WordPress Team'];
+const validDate = value => {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const parsed = new Date(value);
+  return Number.isFinite(+parsed) && parsed.toISOString().slice(0, 10) === value;
+};
 router.use(protect, authorize('CEO', 'Super Admin', 'Client'), (req, res, next) => { res.set('Cache-Control', 'private, no-store'); next(); });
 async function client(id) {
   if (!validId(id)) throw fail(400, 'Choose a valid client.');
@@ -51,13 +58,38 @@ router.patch('/clients/:id', admin, wrap(async (req, res) => {
 }));
 router.get('/projects', wrap(async (req, res) => {
   const filter = executive(req.user) ? {} : { client: req.user._id };
-  const projects = await Project.find(filter).select('title code client clientName status completionPercentage startDate deadline milestones._id milestones.title milestones.deadline milestones.status milestones.progress').sort({ createdAt: -1 }).lean();
+  const projects = await Project.find(filter).select(`${projectFields}${executive(req.user) ? ' projectManager assignedMembers' : ''}`).sort({ createdAt: -1 }).lean();
   const tasks = await Task.find({ project: { $in: projects.map(item => item._id) }, clientVisible: true }).select(taskFields).lean();
   res.json({ success: true, projects: projects.map(item => {
     const visible = tasks.filter(task => String(task.project) === String(item._id));
     const done = visible.filter(task => ['done', 'completed'].includes(task.status)).length;
     return { ...item, totalTasks: visible.length, doneTasks: done, taskProgress: visible.length ? Math.round(done / visible.length * 100) : 0 };
   }) });
+}));
+router.post('/projects', wrap(async (req, res) => {
+  const { title, description = '', department, deadline, priority = 'Medium' } = req.body;
+  if (typeof title !== 'string' || !title.trim() || title.length > 200 || typeof description !== 'string' || description.length > 10000 || !departments.includes(department) || !validDate(deadline) || !['Low', 'Medium', 'High', 'Critical'].includes(priority)) throw fail(400, 'Enter a project name, service, valid due date, description, and priority.');
+  const owner = req.user.role === 'Client' ? req.user : await client(req.body.clientId);
+  if (!owner.isActive) throw fail(400, 'Choose an active client.');
+  // The owner and staff-only fields are always decided by the server.
+  const created = await Project.create({ title: title.trim(), description: description.trim(), department, deadline, priority,
+    code: `NX-CL-${randomBytes(5).toString('hex').toUpperCase()}`, client: owner._id, clientName: owner.company || owner.name,
+    requestedBy: req.user._id, clientRequested: req.user.role === 'Client', status: 'planning', completionPercentage: 0,
+    budget: 0, estimatedHours: 0, spentHours: 0, assignedMembers: [], projectManager: null });
+  await activity.executiveEvent({ key: `client-project:${created._id}`, actor: req.user._id, title: 'New client project', body: 'A project is ready for team assignment.', url: '/clients' });
+  res.status(201).json({ success: true, project: await Project.findById(created._id).select(projectFields) });
+}));
+router.patch('/projects/:id/team', admin, wrap(async (req, res) => {
+  const item = await project(req, req.params.id);
+  const { memberIds, managerId = '' } = req.body;
+  if (!Array.isArray(memberIds) || memberIds.length > 50 || memberIds.some(id => !validId(id)) || (managerId && !validId(managerId))) throw fail(400, 'Choose a valid project lead and up to 50 team members.');
+  const ids = [...new Set([...memberIds, ...(managerId ? [managerId] : [])].map(id => id.toLowerCase()))];
+  if (await User.countDocuments({ _id: { $in: ids }, isActive: true, role: { $ne: 'Client' } }) !== ids.length) throw fail(400, 'Choose active Neximet staff only.');
+  const existing = new Map(item.assignedMembers.map(member => [String(member.user), member.toObject()]));
+  item.projectManager = managerId || null;
+  item.assignedMembers = [...new Set(memberIds.map(id => id.toLowerCase()))].map(user => existing.get(user) || { user });
+  await item.save(); await activity.project(item, req.user._id);
+  res.json({ success: true });
 }));
 router.patch('/projects/:id/client', admin, wrap(async (req, res) => {
   const item = await project(req, req.params.id);
@@ -114,7 +146,7 @@ router.post('/invoices', admin, wrap(async (req, res) => {
     linked = await project(req, req.body.projectId);
     if (String(linked.client) !== String(owner._id)) throw fail(400, 'The project must belong to this client.');
   }
-  const invoice = await Invoice.create({ ...values, number: `NX-${values.issuedAt.getUTCFullYear()}-${randomBytes(5).toString('hex').toUpperCase()}`, client: owner._id, project: linked?._id, createdBy: req.user._id, billTo: { name: owner.name, email: owner.email, company: owner.company, address: owner.billingAddress } });
+  const invoice = await Invoice.create({ ...values, number: `NX-${values.issuedAt.getUTCFullYear()}-${randomBytes(5).toString('hex').toUpperCase()}`, client: owner._id, project: linked?._id, projectTitle: linked?.title || '', createdBy: req.user._id, billTo: { name: owner.name, email: owner.email, company: owner.company, address: owner.billingAddress } });
   await notifications.safely({ key: `invoice:${invoice._id}`, users: [owner._id], actor: req.user._id, kind: 'finance', title: 'New invoice from Neximet', body: `${invoice.number} is available in Finance.`, url: '/client/finance' });
   res.status(201).json({ success: true, invoice });
 }));

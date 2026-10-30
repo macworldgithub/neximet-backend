@@ -1,6 +1,7 @@
 const activity = require('../services/activityNotifications');
 const Project = require('../models/Project');
 const Task = require('../models/Task');
+const { executive } = require('../services/clientAccess');
 const path = require('path');
 const fs = require('fs');
 
@@ -112,6 +113,7 @@ exports.getProjectById = async (req, res) => {
 // @route   POST /api/projects
 exports.createProject = async (req, res) => {
   try {
+    if (req.body.client && !executive(req.user)) return res.status(403).json({ success: false, message: 'Only CEOs and Super Admins can assign client projects.' });
     const newProject = new Project({
       ...req.body,
       projectManager: req.body.projectManager || req.user.id,
@@ -129,6 +131,9 @@ exports.createProject = async (req, res) => {
 // @route   PUT /api/projects/:id
 exports.updateProject = async (req, res) => {
   try {
+    if (Object.keys(req.body).some(key => key.startsWith('$') || key.includes('.'))) return res.status(400).json({ success: false, message: 'Use plain project fields when updating a project.' });
+    const previous = await Project.findById(req.params.id).select('client');
+    if (!executive(req.user) && (previous?.client || req.body.client) && ['assignedMembers', 'projectManager', 'client'].some(key => Object.hasOwn(req.body, key))) return res.status(403).json({ success: false, message: 'Only CEOs and Super Admins can manage client project assignments.' });
     const project = await Project.findByIdAndUpdate(req.params.id, req.body, {
       new: true,
       runValidators: true,
@@ -381,6 +386,7 @@ exports.deleteCredential = async (req, res) => {
 // @route   PUT /api/projects/:id/resources
 exports.updateResources = async (req, res) => {
   try {
+    if (!executive(req.user) && await Project.exists({ _id: req.params.id, client: { $ne: null } })) return res.status(403).json({ success: false, message: 'Only CEOs and Super Admins can manage client project assignments.' });
     const { assignedMembers } = req.body;
     const project = await Project.findById(req.params.id);
     if (!project) {

@@ -21,6 +21,15 @@ function invoiceValues(body) {
   for (const key of ['notes', 'paymentDetails']) if (body[key] !== undefined && (typeof body[key] !== 'string' || body[key].length > 2000)) fail(`${key} must be at most 2,000 characters.`);
   const subtotal = round(items.reduce((sum, item) => sum + item.amount, 0)), tax = round(subtotal * taxRate / 100);
   if (subtotal > 1000000000000) fail('Invoice total is too large.');
-  return { items, currency, issuedAt, dueAt, taxRate, subtotal, tax, total: round(subtotal + tax), notes: body.notes || '', paymentDetails: body.paymentDetails || '' };
+  const issuer = {};
+  if (body.issuer !== undefined && (!body.issuer || typeof body.issuer !== 'object' || Array.isArray(body.issuer))) fail('Enter valid sender details.');
+  for (const [key, limit] of [['name', 160], ['email', 254], ['phone', 80], ['address', 500], ['taxId', 100]]) {
+    const value = body.issuer?.[key] ?? (key === 'name' ? 'Neximet' : '');
+    if (typeof value !== 'string' || value.length > limit || (key === 'name' && !value.trim())) fail(`Invalid sender ${key}.`);
+    issuer[key] = value.trim();
+  }
+  if (issuer.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(issuer.email)) fail('Enter a valid sender email.');
+  for (const [key, limit] of [['reference', 120], ['paymentTerms', 300]]) if (body[key] !== undefined && (typeof body[key] !== 'string' || body[key].length > limit)) fail(`Invalid ${key}.`);
+  return { items, currency, issuedAt, dueAt, taxRate, subtotal, tax, total: round(subtotal + tax), notes: body.notes || '', paymentDetails: body.paymentDetails || '', issuer, reference: body.reference?.trim() || '', paymentTerms: body.paymentTerms?.trim() || '' };
 }
 module.exports = { invoiceValues };

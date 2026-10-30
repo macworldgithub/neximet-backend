@@ -129,15 +129,16 @@ test('client meeting invitations reuse existing rooms, scheduling, and voice/vid
   client.disconnect(); executive.disconnect();
 });
 test('invoice totals are server controlled, validated, tenant isolated, and branded PDFs download', async () => {
-  const body = { clientId: id(alice), projectId: id(projectA), currency: 'USD', issuedAt: '2026-10-29', dueAt: '2026-11-15', items: [{ description: 'Website design and implementation', quantity: 2, rate: 500, amount: 1 }], taxRate: 5, total: 1, status: 'paid', paymentDetails: 'Bank: Example Bank\nReference: invoice number', notes: 'Thank you for working with Neximet.' };
+  const body = { clientId: id(alice), projectId: id(projectA), currency: 'USD', issuedAt: '2026-10-29', dueAt: '2026-11-15', items: [{ description: 'Website design and implementation', quantity: 2, rate: 500, amount: 1 }], taxRate: 5, total: 1, status: 'paid', issuer: { name: 'Neximet', email: 'billing@example.test', phone: '+92 000 0000000', address: 'Example office address (sample data)' }, reference: 'PO-2026-104', paymentTerms: 'Payment due within 17 days of issue.', paymentDetails: 'Bank: Example Bank\nReference: invoice number', notes: 'Thank you for working with Neximet.' };
   assert.equal((await request(alice, '/portal/invoices', body)).status, 403);
   assert.equal((await request(admin, '/portal/invoices', { ...body, projectId: id(projectB) })).status, 400);
   for (const value of [-1, 'NaN', null, true]) assert.equal((await request(admin, '/portal/invoices', { ...body, items: [{ description: 'Invalid', quantity: value, rate: 50 }] })).status, 400);
   const created = await request(admin, '/portal/invoices', body); assert.equal(created.status, 201); invoice = created.body.invoice; assert.equal(invoice.total, 1050); assert.equal(invoice.items[0].amount, 1000); assert.equal(invoice.status, 'issued');
+  assert.equal(invoice.reference, body.reference); assert.equal(invoice.issuer.email, body.issuer.email); assert.equal(invoice.projectTitle, projectA.title); assert.equal(invoice.paymentTerms, body.paymentTerms);
   assert.equal((await request(alice, '/portal/invoices')).body.invoices.length, 1); assert.equal((await request(bob, '/portal/invoices')).body.invoices.length, 0);
   assert.equal((await request(bob, `/portal/invoices/${invoice._id}/pdf`)).status, 404);
   assert.equal((await request(alice, `/portal/invoices/${invoice._id}`, { status: 'paid' }, 'PATCH')).status, 403);
-  const pdf = await request(admin, `/portal/invoices/${invoice._id}/pdf`); assert.equal(pdf.status, 200); assert.equal(pdf.body.subarray(0, 4).toString(), '%PDF'); assert.match(pdf.headers.get('content-disposition'), /attachment/); assert.ok(pdf.body.includes(Buffer.from('/Subtype /Image')));
+  const pdf = await request(admin, `/portal/invoices/${invoice._id}/pdf`); assert.equal(pdf.status, 200); assert.equal(pdf.body.subarray(0, 4).toString(), '%PDF'); assert.match(pdf.headers.get('content-disposition'), /attachment/); assert.ok(pdf.body.includes(Buffer.from('/Subtype /Image'))); assert.equal((pdf.body.toString('latin1').match(/\/Type \/Page\b/g) || []).length, 1, 'A standard invoice fits one page without blank footer pages');
   assert.equal((await request(alice, `/portal/invoices/${invoice._id}/pdf`)).status, 200);
   await mkdir(path.resolve('../tmp/pdfs'), { recursive: true }); await writeFile(path.resolve('../tmp/pdfs/portal-invoice-sample.pdf'), pdf.body);
   const long = { ...invoice, items: Array.from({ length: 50 }, (_, i) => ({ description: `Service ${i + 1}: ` + 'Detailed deliverable description. '.repeat(8), quantity: 1, rate: 20, amount: 20 })), paymentDetails: 'Payment instructions. '.repeat(80), notes: 'Terms and notes. '.repeat(80) };
@@ -148,5 +149,33 @@ test('invoice totals are server controlled, validated, tenant isolated, and bran
 test('invoice validation rejects impossible dates and handles decimal rounding', () => {
   const body = { items: [{ description: 'Fractional item', quantity: 3, rate: 0.1 }], taxRate: 5, currency: 'USD', issuedAt: '2026-10-29', dueAt: '2026-11-30' };
   assert.equal(invoiceValues(body).subtotal, 0.3); assert.equal(invoiceValues(body).total, 0.32);
-  for (const patch of [{ issuedAt: '2026-02-30' }, { dueAt: '2026-01-01' }, { taxRate: 101 }, { currency: '<USD>' }, { items: [] }]) assert.throws(() => invoiceValues({ ...body, ...patch }));
+  for (const patch of [{ issuedAt: '2026-02-30' }, { dueAt: '2026-01-01' }, { taxRate: 101 }, { currency: '<USD>' }, { items: [] }, { issuer: [] }, { issuer: { email: 'invalid' } }, { reference: 'x'.repeat(121) }, { paymentTerms: {} }]) assert.throws(() => invoiceValues({ ...body, ...patch }));
+});
+test('clients create owned projects and tasks; executives exclusively choose staff assignments', async () => {
+  const body = { title: 'Client-owned launch', description: 'Build the new product site.', department: 'Software Development', deadline: '2026-12-01', priority: 'High', clientId: id(bob), client: id(bob), assignedMembers: [{ user: id(employee) }], projectManager: id(employee), budget: 99999, completionPercentage: 100, status: 'completed', code: 'INJECTED' };
+  assert.equal((await request(null, '/portal/projects', body)).status, 401);
+  assert.equal((await request(employee, '/portal/projects', body)).status, 403);
+  assert.equal((await request(alice, '/portal/projects', { ...body, deadline: '2026-02-30' })).status, 400);
+  const created = await request(alice, '/portal/projects', body); assert.equal(created.status, 201);
+  const item = await Project.findById(created.body.project._id); assert.equal(id(item.client), id(alice)); assert.equal(item.projectManager, null); assert.equal(item.assignedMembers.length, 0); assert.equal(item.budget, 0); assert.equal(item.status, 'planning'); assert.equal(item.clientRequested, true); assert.notEqual(item.code, 'INJECTED');
+  assert.equal(created.body.project.assignedMembers, undefined); assert.equal(created.body.project.requestedBy, undefined);
+  assert.ok(await Notification.exists({ user: admin._id, key: `client-project:${item._id}` }));
+  assert.equal((await request(bob, `/portal/projects/${item._id}/tasks`)).status, 404);
+  const team = { memberIds: [id(employee)], managerId: id(admin) };
+  assert.equal((await request(alice, `/portal/projects/${item._id}/team`, team, 'PATCH')).status, 403);
+  assert.equal((await request(admin, `/portal/projects/${item._id}/team`, { ...team, memberIds: [id(bob)] }, 'PATCH')).status, 400);
+  assert.equal((await request(admin, `/portal/projects/${item._id}/team`, team, 'PATCH')).status, 200);
+  const assigned = await Project.findById(item._id); assert.equal(id(assigned.projectManager), id(admin)); assert.equal(id(assigned.assignedMembers[0].user), id(employee));
+  const publicView = (await request(alice, '/portal/projects')).body.projects.find(project => project._id === id(item)); assert.equal(publicView.assignedMembers, undefined); assert.equal(publicView.projectManager, undefined);
+  const task = await request(alice, `/portal/projects/${item._id}/tasks`, { title: 'Prepare launch assets', assignedTo: id(employee) }); assert.equal(task.status, 201);
+  assert.equal((await request(employee, `/tasks/${task.body.task._id}`, { assignedTo: id(ceo) }, 'PUT')).status, 403);
+  assert.equal((await request(employee, '/tasks', { project: id(item), title: 'Self-assigned', assignedTo: id(employee) })).status, 403);
+  assert.equal((await request(admin, `/portal/tasks/${task.body.task._id}`, { assignedTo: id(employee) }, 'PATCH')).status, 200);
+  assert.equal((await request(employee, `/tasks/${task.body.task._id}`, { assignedTo: id(employee), project: id(item), description: 'Delivery update' }, 'PUT')).status, 200);
+  assert.equal((await request(employee, `/tasks/${task.body.task._id}`, { $set: { assignedTo: id(ceo) } }, 'PUT')).status, 400);
+  assert.equal((await request(employee, `/tasks/${task.body.task._id}/status`, { status: 'in_progress' }, 'PATCH')).status, 200);
+  await User.updateOne({ _id: employee._id }, { role: 'Project Manager' });
+  assert.equal((await request(employee, `/projects/${item._id}`, { assignedMembers: [] }, 'PUT')).status, 403);
+  assert.equal((await request(employee, `/projects/${item._id}/resources`, { assignedMembers: [] }, 'PUT')).status, 403);
+  assert.equal((await request(employee, `/projects/${item._id}`, { description: 'Updated delivery brief' }, 'PUT')).status, 200);
 });

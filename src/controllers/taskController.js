@@ -2,6 +2,13 @@ const activity = require('../services/activityNotifications');
 const Task = require('../models/Task');
 const TimeLog = require('../models/TimeLog');
 const Project = require('../models/Project');
+const { executive } = require('../services/clientAccess');
+
+async function assignmentAuthority(req, projectIds) {
+  if (!executive(req.user) && await Project.exists({ _id: { $in: projectIds.filter(Boolean) }, client: { $ne: null } })) {
+    throw Object.assign(new Error('Only CEOs and Super Admins can assign work on client projects.'), { status: 403 });
+  }
+}
 
 // Helper to auto-generate issue key like NX-AI-101
 async function generateIssueKey(projectId) {
@@ -70,6 +77,7 @@ exports.getTasksByProject = async (req, res) => {
 exports.createTask = async (req, res) => {
   try {
     const taskData = { ...req.body };
+    if (taskData.assignedTo) await assignmentAuthority(req, [taskData.project]);
 
     // Auto-generate issueKey if not provided
     if (!taskData.issueKey && taskData.project) {
@@ -92,7 +100,7 @@ exports.createTask = async (req, res) => {
     await activity.task(task, req.user.id, 'created');
     res.status(201).json({ success: true, task: populated });
   } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
+    res.status(error.status || 400).json({ success: false, message: error.message });
   }
 };
 
@@ -101,6 +109,9 @@ exports.createTask = async (req, res) => {
 exports.updateTask = async (req, res) => {
   try {
     const previous = await Task.findById(req.params.id).lean();
+    if (Object.keys(req.body).some(key => key.startsWith('$') || key.includes('.'))) return res.status(400).json({ success: false, message: 'Use plain task fields when updating a task.' });
+    const idOf = value => String(value?._id || value || '');
+    if ((Object.hasOwn(req.body, 'assignedTo') && idOf(req.body.assignedTo) !== idOf(previous?.assignedTo)) || (Object.hasOwn(req.body, 'project') && idOf(req.body.project) !== idOf(previous?.project))) await assignmentAuthority(req, [previous?.project, req.body.project]);
     const task = await Task.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true })
       .populate('assignedTo', 'name email department designation role')
       .populate('reporter', 'name email department designation role')
@@ -114,7 +125,7 @@ exports.updateTask = async (req, res) => {
     if (fields.some(key => req.body[key] !== undefined && String(previous?.[key]?._id || previous?.[key] || '') !== String(task[key]?._id || task[key] || ''))) await activity.task(task, req.user.id, 'updated', previous?.assignedTo);
     res.json({ success: true, task });
   } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
+    res.status(error.status || 400).json({ success: false, message: error.message });
   }
 };
 
@@ -140,7 +151,7 @@ exports.updateTaskStatus = async (req, res) => {
     if (previous?.status !== task.status) await activity.task(task, req.user.id, 'status');
     res.json({ success: true, task });
   } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
+    res.status(error.status || 400).json({ success: false, message: error.message });
   }
 };
 
@@ -169,7 +180,7 @@ exports.addSubtask = async (req, res) => {
     await activity.task(task, req.user.id, 'progress');
     res.json({ success: true, task: populated });
   } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
+    res.status(error.status || 400).json({ success: false, message: error.message });
   }
 };
 
@@ -198,7 +209,7 @@ exports.toggleSubtask = async (req, res) => {
     await activity.task(task, req.user.id, 'progress');
     res.json({ success: true, task: populated });
   } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
+    res.status(error.status || 400).json({ success: false, message: error.message });
   }
 };
 
@@ -222,7 +233,7 @@ exports.deleteSubtask = async (req, res) => {
     await activity.task(task, req.user.id, 'progress');
     res.json({ success: true, task: populated });
   } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
+    res.status(error.status || 400).json({ success: false, message: error.message });
   }
 };
 
@@ -255,7 +266,7 @@ exports.addComment = async (req, res) => {
     await activity.task(task, req.user.id, 'comment');
     res.json({ success: true, task: populated });
   } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
+    res.status(error.status || 400).json({ success: false, message: error.message });
   }
 };
 
@@ -306,7 +317,7 @@ exports.logTime = async (req, res) => {
 
     res.status(201).json({ success: true, timeLog: populated });
   } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
+    res.status(error.status || 400).json({ success: false, message: error.message });
   }
 };
 
@@ -377,7 +388,7 @@ exports.updateTimeLog = async (req, res) => {
 
     res.json({ success: true, timeLog: populated });
   } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
+    res.status(error.status || 400).json({ success: false, message: error.message });
   }
 };
 

@@ -120,6 +120,8 @@ const scopeDocumentSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 const projectSchema = new mongoose.Schema({
+  clientRequested: { type: Boolean, default: false },
+  requestedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   client: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true, default: null },
   title: {
     type: String,
