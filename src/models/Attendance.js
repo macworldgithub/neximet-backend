@@ -28,13 +28,13 @@ const attendanceSchema = new mongoose.Schema({
   quarantine: { reason: String, at: Date },
   deviceLockKey: String,
   override: {
-    type: { type: String, enum: ['absent', 'present'] },
+    type: { type: String, enum: ['absent', 'present', 'late', 'half_day'] },
     snapshot: mongoose.Schema.Types.Mixed,
     by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     at: Date,
   },
   auditTrail: [{
-    action: { type: String, enum: ['mark_absent', 'mark_present', 'restore', 'leave_adjustment', 'repeat_adjustment', 'repair'] },
+    action: { type: String, enum: ['mark_absent', 'mark_present', 'restore', 'leave_adjustment', 'repeat_adjustment', 'repair', 'admin_edit'] },
     by: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     at: { type: Date, default: Date.now },
     reason: String,

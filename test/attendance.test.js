@@ -1120,3 +1120,64 @@ test('working-date repair aligns derived schedule bounds and hours while retaini
     assert.equal(repaired.deductionAmount, row.deductionAmount);
   }
 });
+
+test('CEO and Super Admin can edit attendance times and status with audit trail and calculations', async t => {
+  t.mock.timers.reset(); t.mock.timers.enable({ apis: ['Date'], now: p.atCompanyTime('2026-10-15', '12:00').getTime() });
+  Date.now = actualNow;
+
+  // 1. Team member is rejected
+  const forbidden = await request(people[0], '/attendance/edit', {
+    userId: people[1]._id,
+    date: '2026-10-15',
+    status: 'present',
+  });
+  assert.equal(forbidden.status, 403);
+
+  // 2. CEO can mark employee present and adjust check-in / check-out times
+  const resPresent = await request(people[2], '/attendance/edit', {
+    userId: people[0]._id,
+    date: '2026-10-15',
+    status: 'present',
+    checkInTime: '09:00',
+    checkOutTime: '18:00',
+    notes: 'CEO approved official arrival time',
+  });
+  assert.equal(resPresent.status, 200, resPresent.body.message);
+  assert.equal(resPresent.body.success, true);
+  const docPresent = await Attendance.findById(resPresent.body.attendance._id);
+  assert.equal(docPresent.status, 'present');
+  assert.equal(docPresent.isLate, false);
+  assert.equal(docPresent.deductionAmount, 0);
+  assert.equal(docPresent.totalWorkHours, 9);
+  assert.equal(docPresent.auditTrail.at(-1).action, 'admin_edit');
+  assert.ok(docPresent.auditTrail.at(-1).reason.includes('CEO approved official arrival time'));
+
+  // 3. Super Admin can edit existing record to late with updated time and minutes late
+  const resLate = await request(people[3], `/attendance/records/${docPresent._id}`, {
+    status: 'late',
+    checkInTime: '09:45',
+    checkOutTime: '18:00',
+    minutesLate: 45,
+    notes: 'Super Admin adjusted time to 09:45 AM',
+  }, 'PUT');
+  assert.equal(resLate.status, 200, resLate.body.message);
+  const docLate = await Attendance.findById(docPresent._id);
+  assert.equal(docLate.status, 'late');
+  assert.equal(docLate.isLate, true);
+  assert.equal(docLate.minutesLate, 45);
+  assert.equal(docLate.totalWorkHours, 8.25);
+  assert.equal(docLate.auditTrail.at(-1).action, 'admin_edit');
+
+  // 4. CEO can mark half_day or absent
+  const resAbsent = await request(people[2], '/attendance/edit', {
+    userId: people[0]._id,
+    date: '2026-10-15',
+    status: 'absent',
+    notes: 'CEO marked absent for full day',
+  });
+  assert.equal(resAbsent.status, 200);
+  const docAbsent = await Attendance.findById(docPresent._id);
+  assert.equal(docAbsent.status, 'absent');
+  assert.equal(docAbsent.deductionPercentage, 100);
+  assert.equal(docAbsent.deductionAmount, 1000);
+});

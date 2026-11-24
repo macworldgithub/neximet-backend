@@ -303,3 +303,204 @@ async function overrideAttendance(req, res, absent) {
 }
 exports.markAbsent = wrap((req, res) => overrideAttendance(req, res, true));
 exports.markPresent = wrap((req, res) => overrideAttendance(req, res, false));
+
+exports.editAttendance = wrap(async (req, res) => {
+  if (!executive(req.user)) fail('Administrator access required.', 403);
+  let rule = await activeRule();
+  let recordToEdit = null;
+  if (req.params.id) {
+    recordToEdit = await Attendance.findById(id(req.params.id));
+    if (!recordToEdit) fail('Attendance record not found.', 404);
+  }
+  const userId = id(req.body.userId || recordToEdit?.user);
+  const date = req.body.date || recordToEdit?.date || shiftDate(new Date(), rule);
+  if (!validDate(date) || date > companyDate()) fail('Attendance adjustment requires a valid date that is not in the future.');
+
+  const parseTime = (val) => {
+    if (!val || typeof val !== 'string') return null;
+    const trimmed = val.trim();
+    if (!trimmed) return null;
+    if (/^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/.test(trimmed)) {
+      return atCompanyTime(date, trimmed.slice(0, 5));
+    }
+    const d = new Date(trimmed);
+    return Number.isFinite(d.getTime()) ? d : null;
+  };
+
+  const status = req.body.status || recordToEdit?.status || 'present';
+  if (!['present', 'late', 'half_day', 'absent'].includes(status)) {
+    fail('Status must be present, late, half_day, or absent.');
+  }
+
+  if (req.body.expectedRecordId !== undefined && req.body.expectedRecordId !== null) id(req.body.expectedRecordId);
+  if (req.body.expectedVersion !== undefined && req.body.expectedVersion !== null && (!Number.isInteger(req.body.expectedVersion) || req.body.expectedVersion < 0)) fail('Invalid attendance record version.');
+
+  await Attendance.init();
+  let employeeName;
+
+  const updated = await mongoose.connection.transaction(async transaction => {
+    const targetUser = await User.findOneAndUpdate({ _id: userId }, { $inc: { attendanceVersion: 1 } }, { new: true, session: transaction }).select('+employmentGaps +attendanceTrackingFrom');
+    if (!targetUser) fail('Employee not found.', 404);
+    employeeName = targetUser.name;
+
+    const record = recordToEdit
+      ? await Attendance.findById(recordToEdit._id).session(transaction)
+      : await Attendance.findOne({ user: userId, date }).session(transaction);
+
+    if (record?.quarantine?.at) fail('Repair the attendance evidence before applying an attendance adjustment.', 409);
+    if ((req.body.expectedRecordId !== undefined && (record ? String(record._id) : null) !== req.body.expectedRecordId) || (req.body.expectedVersion !== undefined && (record?.__v ?? null) !== req.body.expectedVersion)) {
+      fail('Attendance changed since you opened this action. Refresh and review it again.', 409);
+    }
+    if (!record && !employedOn(targetUser, date)) fail('Cannot create attendance outside the employee\'s employment period.', 404);
+    if (!targetUser.isActive && (!record || (targetUser.deactivatedAt && date > companyDate(targetUser.deactivatedAt)))) fail('Only recorded attendance before the employee left can be corrected.', 404);
+
+    const currentRule = await activeRule(transaction);
+    rule = normalizeRule(record?.policySnapshot || (record ? { ...currentRule, policyVersion: undefined } : currentRule));
+    const wage = record?.wageSnapshot ?? dailyWage(targetUser);
+    const previousStatus = record?.status || 'not_checked_in';
+    const previousState = record ? Object.fromEntries(['status','isLate','minutesLate','checkIn','checkOut','totalWorkHours','deductionAmount','deductionPercentage','deductionReason','notes','financialReviewRequired'].map(key => [key, record[key]])) : null;
+
+    let checkIn = null;
+    let checkOut = null;
+
+    if (status !== 'absent') {
+      if (req.body.checkInTime !== undefined) {
+        checkIn = parseTime(req.body.checkInTime);
+      } else if (record?.checkIn) {
+        checkIn = record.checkIn;
+      } else {
+        checkIn = atCompanyTime(date, status === 'late' ? '09:30' : status === 'half_day' ? '13:30' : rule.shiftStartTime || '09:00');
+      }
+
+      if (req.body.checkOutTime !== undefined) {
+        checkOut = parseTime(req.body.checkOutTime);
+      } else if (record?.checkOut) {
+        checkOut = record.checkOut;
+      }
+    }
+
+    let totalWorkHours = 0;
+    if (req.body.totalWorkHours !== undefined && req.body.totalWorkHours !== null && req.body.totalWorkHours !== '' && Number.isFinite(Number(req.body.totalWorkHours))) {
+      totalWorkHours = Math.max(0, Number(Number(req.body.totalWorkHours).toFixed(2)));
+    } else if (checkIn && checkOut) {
+      totalWorkHours = Math.max(0, Number(((new Date(checkOut).getTime() - new Date(checkIn).getTime()) / 3600000).toFixed(2)));
+    } else if (status === 'present') {
+      totalWorkHours = record?.totalWorkHours || 9;
+    } else if (status === 'half_day') {
+      totalWorkHours = record?.totalWorkHours || 4.5;
+    } else if (status === 'late') {
+      totalWorkHours = record?.totalWorkHours || 8.5;
+    }
+
+    let isLate = false;
+    let minutesLate = 0;
+    let deductionPercentage = 0;
+    let deductionAmount = 0;
+
+    const priorLateCount = await Attendance.countDocuments(lateCountFilter(userId, date, rule)).session(transaction);
+    const exemptions = await dayExemptions(date, [userId], rule, transaction);
+
+    if (status === 'present') {
+      isLate = false;
+      minutesLate = 0;
+      deductionAmount = 0;
+      deductionPercentage = 0;
+    } else if (status === 'absent') {
+      isLate = false;
+      minutesLate = 0;
+      const coverage = exemptions;
+      const percentage = coverage.holiday || coverage.leaveUsers.has(String(userId)) || !isWorkingDay(date, rule) ? 0 : coverage.halfDayUsers.has(String(userId)) ? 50 : 100;
+      deductionPercentage = percentage;
+      deductionAmount = Math.round(wage * percentage) / 100;
+    } else if (status === 'half_day') {
+      isLate = false;
+      minutesLate = 0;
+      deductionPercentage = 50;
+      deductionAmount = Math.round(wage * 0.5);
+    } else if (status === 'late') {
+      isLate = true;
+      if (req.body.minutesLate !== undefined && req.body.minutesLate !== null && Number.isFinite(Number(req.body.minutesLate))) {
+        minutesLate = Math.max(1, Math.round(Number(req.body.minutesLate)));
+      } else if (checkIn) {
+        const shiftStart = atCompanyTime(date, rule.shiftStartTime || '09:00');
+        const diff = Math.round((new Date(checkIn).getTime() - shiftStart.getTime()) / 60000);
+        minutesLate = Math.max(1, diff > 0 ? diff : 16);
+      } else {
+        minutesLate = 16;
+      }
+      if (checkIn) {
+        const calc = attendanceCalculation(checkIn, date, targetUser, rule, exemptions, priorLateCount);
+        deductionAmount = calc.deductionAmount || 0;
+        deductionPercentage = calc.deductionPercentage || 0;
+      }
+    }
+
+    // CEO custom override for deduction if provided
+    if (req.user.role === 'CEO' && req.body.deductionAmount !== undefined && req.body.deductionAmount !== null && req.body.deductionAmount !== '' && Number.isFinite(Number(req.body.deductionAmount))) {
+      deductionAmount = Math.max(0, Math.round(Number(req.body.deductionAmount)));
+      deductionPercentage = wage > 0 ? Math.round((deductionAmount / wage) * 100) : 0;
+    }
+
+    const defaultReason = `Administrator updated attendance: status=${status.replace('_', ' ')}${checkIn ? ', check-in=' + new Intl.DateTimeFormat('en-CA', { timeZone: TIME_ZONE, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(checkIn)) : ''}${checkOut ? ', check-out=' + new Intl.DateTimeFormat('en-CA', { timeZone: TIME_ZONE, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(checkOut)) : ''}.`;
+    const reason = text(req.body.notes || req.body.reason) || defaultReason;
+
+    const fields = {
+      status,
+      checkIn,
+      checkOut,
+      totalWorkHours,
+      isLate,
+      minutesLate,
+      deductionAmount,
+      deductionPercentage,
+      deductionReason: reason,
+      notes: reason,
+      financialReviewRequired: false,
+      override: { type: status, by: req.user.id, at: new Date() },
+      recordSource: 'administrator',
+      policySnapshot: rule,
+      wageSnapshot: wage,
+    };
+
+    const event = {
+      action: 'admin_edit',
+      by: req.user.id,
+      at: new Date(),
+      reason,
+      previousStatus,
+      previousState,
+    };
+
+    const saved = record
+      ? await Attendance.findOneAndUpdate(
+          { _id: record._id, __v: record.__v === undefined ? { $exists: false } : record.__v },
+          { $set: fields, $inc: { __v: 1 }, $push: { auditTrail: event } },
+          { new: true, runValidators: true, session: transaction }
+        ).select('-auditTrail -override.snapshot')
+      : (await Attendance.create([{ user: userId, date, ...fields, auditTrail: [event] }], { session: transaction }))[0];
+
+    if (!saved) fail('Attendance changed concurrently. Refresh and try again.', 409);
+    if (record?.isLate !== fields.isLate) {
+      await reconcileMonthlyLate(userId, new Set([date.slice(0, 7)]), req.user.id, rule, transaction, `Administrator correction on ${date} changed a monthly late incident.`);
+    }
+    return saved;
+  });
+
+  await closeEndedShifts(rule, { user: userId });
+  const saved = await Attendance.findById(updated._id).select('-auditTrail -override.snapshot');
+  await notifications.safely({
+    key: `attendance:${saved._id}:${saved.__v}:edit`,
+    users: [userId],
+    actor: req.user.id,
+    kind: 'attendance',
+    title: 'Your attendance was updated by an administrator',
+    body: `Your attendance for ${date} was updated by an administrator. Check your attendance history to review it.`,
+    url: '/attendance',
+  });
+
+  res.json({
+    success: true,
+    message: `${employeeName}: attendance updated to ${status.replace('_', ' ')} for ${date}.`,
+    attendance: saved,
+  });
+});
