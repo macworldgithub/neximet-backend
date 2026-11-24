@@ -245,7 +245,6 @@ exports.repairRecord = wrap(async (req, res) => {
     return updated;
   });
   if (!repaired) fail('Attendance changed while repairing. Refresh before retrying.', 409);
-  await notifications.safely({ key: `attendance:${repaired._id}:repair:${repaired.__v}`, users: [record.user], actor: req.user.id, kind: 'attendance', title: 'Your attendance record was corrected', body: `An administrator repaired your attendance for ${date}. Open your attendance history to review it.`, url: '/attendance' });
   await closeEndedShifts(rule, { user: record.user });
   res.json({ success: true, message: 'Legacy record repaired with an audit trail.', attendance: await Attendance.findById(repaired._id).select('-photo -auditTrail -override.snapshot') });
 });
@@ -298,7 +297,6 @@ async function overrideAttendance(req, res, absent) {
   });
   await closeEndedShifts(rule, { user: userId });
   const saved = await Attendance.findById(updated._id).select('-auditTrail -override.snapshot');
-  await notifications.safely({ key: `attendance:${saved._id}:${saved.__v}:${absent ? 'absent' : 'present'}`, users: [userId], actor: req.user.id, kind: 'attendance', title: 'Your attendance was updated by an administrator', body: `Your attendance for ${date} changed. Open your attendance history to review it.`, url: '/attendance' });
   res.json({ success: true, message: employeeName + ': ' + (absent ? 'marked absent' : req.body.verifyPresence ? 'presence verified without deduction' : 'attendance restored') + ' for ' + date + '. Original check-in evidence retained.', attendance: saved });
 }
 exports.markAbsent = wrap((req, res) => overrideAttendance(req, res, true));
@@ -488,15 +486,6 @@ exports.editAttendance = wrap(async (req, res) => {
 
   await closeEndedShifts(rule, { user: userId });
   const saved = await Attendance.findById(updated._id).select('-auditTrail -override.snapshot');
-  await notifications.safely({
-    key: `attendance:${saved._id}:${saved.__v}:edit`,
-    users: [userId],
-    actor: req.user.id,
-    kind: 'attendance',
-    title: 'Your attendance was updated by an administrator',
-    body: `Your attendance for ${date} was updated by an administrator. Check your attendance history to review it.`,
-    url: '/attendance',
-  });
 
   res.json({
     success: true,
